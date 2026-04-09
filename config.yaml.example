@@ -1,0 +1,47 @@
+# hanotifications configuration
+# Copy to ~/.config/hanotifications/config.yaml and edit.
+
+# -------------------------------------------------------------------
+# Home Assistant connection
+# -------------------------------------------------------------------
+
+# Base URL of your HA instance (no trailing slash)
+ha_url: "http://homeassistant.local:8123"
+
+# Long-lived access token (Profile → Security → Long-Lived Access Tokens)
+ha_token: "YOUR_HA_LONG_LIVED_TOKEN"
+
+# Set to false only if HA uses a self-signed TLS cert
+ha_ssl_verify: true
+
+# -------------------------------------------------------------------
+# Webhook listener
+# -------------------------------------------------------------------
+
+# Only bind to loopback. If HA is on a different host you can use
+# 0.0.0.0, but then the webhook_secret becomes critical.
+host: "127.0.0.1"
+port: 8765
+
+# Secret that Home Assistant must supply when calling the webhook.
+# HA can send it as:
+#   Authorization: Bearer <webhook_secret>
+# or as an HMAC-SHA256 signature:
+#   X-HA-Signature: sha256=<hex digest of body>
+#
+# Leave empty ("") to disable authentication (only safe on loopback).
+webhook_secret: "change-me-to-a-random-string"
+
+# -------------------------------------------------------------------
+# Notification defaults
+# -------------------------------------------------------------------
+
+# Timeout in milliseconds (0 = never expire)
+default_timeout_ms: 10000
+
+# low | normal | critical
+default_urgency: "normal"
+
+# Maximum image dimension in pixels when embedding in D-Bus payload.
+# Larger = better quality, larger D-Bus message.
+max_image_px: 512

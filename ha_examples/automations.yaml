@@ -1,0 +1,70 @@
+# Example automations that use the desktop_notify rest_command.
+# Paste into automations.yaml or the HA automation editor.
+
+# ---------------------------------------------------------------------------
+# 1. Simple text notification
+# ---------------------------------------------------------------------------
+- alias: "Notify desktop: doorbell"
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.doorbell
+      to: "on"
+  action:
+    - service: rest_command.desktop_notify
+      data:
+        title: "Doorbell"
+        message: "Someone is at the front door."
+        urgency: "normal"
+
+# ---------------------------------------------------------------------------
+# 2. Notification with camera snapshot (entity shortcut)
+#    hanotifications fetches the snapshot from HA using your ha_token.
+# ---------------------------------------------------------------------------
+- alias: "Notify desktop: front door motion with camera"
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.front_door_motion
+      to: "on"
+  action:
+    - service: rest_command.desktop_notify
+      data:
+        title: "Motion Detected"
+        message: "Front door camera triggered."
+        camera_entity: "camera.front_door"   # ← entity ID, no image_url needed
+        urgency: "normal"
+        timeout_ms: 15000
+
+# ---------------------------------------------------------------------------
+# 3. Notification with an explicit image URL
+#    Useful for image_url values returned by other integrations (e.g. Frigate).
+# ---------------------------------------------------------------------------
+- alias: "Notify desktop: Frigate person detected"
+  trigger:
+    - platform: mqtt
+      topic: "frigate/events"
+  condition:
+    - condition: template
+      value_template: "{{ trigger.payload_json.type == 'new' and trigger.payload_json.after.label == 'person' }}"
+  action:
+    - service: rest_command.desktop_notify
+      data:
+        title: "Person Detected"
+        message: "Frigate: {{ trigger.payload_json.after.camera }}"
+        image_url: "http://homeassistant.local:8123/api/frigate/notifications/{{ trigger.payload_json.after.id }}/snapshot.jpg"
+        urgency: "normal"
+
+# ---------------------------------------------------------------------------
+# 4. Critical alert (persistent, red border in KDE)
+# ---------------------------------------------------------------------------
+- alias: "Notify desktop: smoke alarm"
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.smoke_detector
+      to: "on"
+  action:
+    - service: rest_command.desktop_notify
+      data:
+        title: "SMOKE ALARM"
+        message: "Smoke detected in the house!"
+        urgency: "critical"
+        timeout_ms: 0   # 0 = do not auto-dismiss

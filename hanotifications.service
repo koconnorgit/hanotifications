@@ -1,0 +1,30 @@
+# systemd USER service for hanotifications
+# Install to: ~/.config/systemd/user/hanotifications.service
+#
+# Then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hanotifications
+#   systemctl --user status hanotifications
+
+[Unit]
+Description=Home Assistant → KDE Plasma notification bridge
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/hanotifications/hanotifications.py
+Restart=on-failure
+RestartSec=5
+
+# Forward the D-Bus session bus address so D-Bus notifications work.
+# With modern systemd --user this is inherited automatically; the
+# explicit passthrough below is a safety net for older setups.
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
+
+# Log to the journal (view with: journalctl --user -u hanotifications -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

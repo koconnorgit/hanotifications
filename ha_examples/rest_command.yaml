@@ -1,0 +1,21 @@
+# Add to configuration.yaml (or a file included from it via !include)
+#
+# This defines a reusable REST command that calls the hanotifications webhook.
+# Replace the URL and secret to match your config.yaml.
+
+rest_command:
+  desktop_notify:
+    url: "http://127.0.0.1:8765/notify"   # adjust host if HA is on another machine
+    method: POST
+    headers:
+      Authorization: "Bearer change-me-to-a-random-string"
+      Content-Type: "application/json"
+    payload: >-
+      {
+        "title": "{{ title }}",
+        "message": "{{ message }}",
+        "urgency": "{{ urgency | default('normal') }}",
+        "timeout_ms": {{ timeout_ms | default(10000) }}
+        {% if image_url is defined %}, "image_url": "{{ image_url }}"{% endif %}
+        {% if camera_entity is defined %}, "camera_entity": "{{ camera_entity }}"{% endif %}
+      }

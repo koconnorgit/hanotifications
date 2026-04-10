@@ -19,14 +19,14 @@ hanotifications  (aiohttp webhook server, systemd user service)
         ▼
  ┌──────────────────────────────────┐
  │  image present?                  │
- │  yes → custom tkinter popup      │  ← full-width image, click to open live feed
+ │  yes → custom tkinter popup      │  ← full-width image, auto-dismisses
  │  no  → KDE Plasma notification   │  ← D-Bus org.freedesktop.Notifications
  └──────────────────────────────────┘
 ```
 
 - HA calls a local HTTP webhook with a JSON payload
 - The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then displays a notification
-- **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the screen, showing the image at configurable full width — much larger than a standard notification thumbnail. Clicking the popup dismisses it; if the notification came from a `camera_entity`, clicking also opens the camera's live MJPEG stream in the default browser
+- **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the screen, showing the image at configurable full width — much larger than a standard notification thumbnail
 - **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
 
 ---
@@ -254,7 +254,7 @@ More examples are in [`ha_examples/automations.yaml`](ha_examples/automations.ya
 |---|---|---|
 | `title` | string | Notification title. Defaults to `"Home Assistant"` |
 | `message` | string | Notification body text |
-| `camera_entity` | string | HA camera entity ID (e.g. `camera.front_door`). The service fetches the snapshot using your `ha_token`. Clicking the popup opens the camera's live MJPEG stream in the browser |
+| `camera_entity` | string | HA camera entity ID (e.g. `camera.front_door`). The service fetches the snapshot using your `ha_token` |
 | `image_url` | string | Explicit image URL. If the URL starts with `ha_url`, the `ha_token` is added automatically |
 | `urgency` | string | `low`, `normal`, or `critical`. Defaults to `default_urgency` from config |
 | `timeout_ms` | integer | Display duration in milliseconds. `0` = never dismiss. Defaults to `default_timeout_ms` |

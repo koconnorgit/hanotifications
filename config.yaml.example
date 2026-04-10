@@ -43,5 +43,14 @@ default_timeout_ms: 10000
 default_urgency: "normal"
 
 # Maximum image dimension in pixels when embedding in D-Bus payload.
+# Only used when falling back to the standard notification path.
 # Larger = better quality, larger D-Bus message.
 max_image_px: 512
+
+# Width in pixels of the custom image popup window.
+# When an image is present and tkinter + Pillow are available, hanotifications
+# shows a standalone popup at this width instead of the standard notification.
+# The window appears in the bottom-right corner and auto-dismisses after
+# default_timeout_ms. Click anywhere on the popup to dismiss it early.
+# Set to 0 to disable the custom popup and always use the standard notification.
+image_popup_width: 640

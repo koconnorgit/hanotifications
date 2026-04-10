@@ -17,25 +17,33 @@ hanotifications  (aiohttp webhook server, systemd user service)
         │
         │  fetches image from HA API (camera_proxy or arbitrary URL)
         ▼
-KDE Plasma notification  (D-Bus org.freedesktop.Notifications)
+ ┌──────────────────────────────────┐
+ │  image present?                  │
+ │  yes → custom tkinter popup      │  ← full-width image, auto-dismisses
+ │  no  → KDE Plasma notification   │  ← D-Bus org.freedesktop.Notifications
+ └──────────────────────────────────┘
 ```
 
 - HA calls a local HTTP webhook with a JSON payload
-- The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then pops up a native KDE Plasma notification
-- Notifications use the **D-Bus `image-data` hint** for an embedded image preview; falls back to `notify-send -i` if `python-dbus` or `Pillow` are unavailable
+- The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then displays a notification
+- **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the screen, showing the image at configurable full width — much larger than a standard notification thumbnail
+- **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
 
 ---
 
 ## Requirements
 
-| Package | Purpose |
-|---|---|
-| `python` | Runtime |
-| `python-aiohttp` | Webhook HTTP server |
-| `python-yaml` | Config file parsing |
-| `python-dbus` | Rich D-Bus notifications with embedded images |
-| `python-pillow` | Image resizing before embedding in D-Bus payload |
-| `libnotify` | `notify-send` fallback |
+| Package | Required | Purpose |
+|---|---|---|
+| `python` | yes | Runtime |
+| `python-aiohttp` | yes | Webhook HTTP server |
+| `python-yaml` | yes | Config file parsing |
+| `python-pillow` | recommended | Image resizing for the custom popup (and D-Bus payload) |
+| `tk` | recommended | Custom large-image popup window (`python-tk` / `tk` package) |
+| `python-dbus` | optional | D-Bus notifications with embedded images (text-only fallback if absent) |
+| `libnotify` | optional | `notify-send` fallback when D-Bus is unavailable |
+
+> **Without Pillow + tkinter:** image notifications fall back to a standard KDE Plasma notification with a small embedded thumbnail.
 
 ---
 
@@ -119,7 +127,14 @@ default_timeout_ms: 10000   # 0 = never auto-dismiss
 default_urgency: "normal"   # low | normal | critical
 
 # Max image dimension (px) when embedding image data in D-Bus payload
+# (only used when falling back to the standard notification path)
 max_image_px: 512
+
+# Width (px) of the custom image popup window.
+# When an image is present and tkinter + Pillow are available, a standalone
+# popup window is shown at this width instead of the standard notification.
+# Set to 0 to disable the custom popup and always use the standard notification.
+image_popup_width: 640
 ```
 
 ---

@@ -46,7 +46,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 _POPUP_SCRIPT = r"""
-import sys, os, json, io, threading, ssl
+import sys, os, json
 try:
     import tkinter as tk
     from PIL import Image, ImageTk
@@ -54,15 +54,12 @@ except ImportError as exc:
     print(f"popup: missing dependency: {exc}", file=sys.stderr)
     sys.exit(1)
 
-data        = json.loads(sys.argv[1])
-title       = data['title']
-body        = data['body']
-path        = data['path']
-width       = data['width']
-timeout     = data['timeout_ms']
-camera_url  = data.get('camera_url')   # MJPEG stream URL, or None
-ha_token    = data.get('ha_token', '')
-ssl_verify  = data.get('ha_ssl_verify', True)
+data     = json.loads(sys.argv[1])
+title    = data['title']
+body     = data['body']
+path     = data['path']
+width    = data['width']
+timeout  = data['timeout_ms']
 
 root = tk.Tk()
 root.title(title)
@@ -70,17 +67,16 @@ root.attributes('-topmost', True)
 root.configure(bg='#2b2b2b')
 root.resizable(False, False)
 
-img_label = None
-
-def _scale(img):
-    iw, ih = img.size
-    return img.resize((width, int(ih * width / iw)), Image.LANCZOS)
-
 try:
-    photo = ImageTk.PhotoImage(_scale(Image.open(path).convert('RGB')))
-    img_label = tk.Label(root, image=photo, bg='#2b2b2b', cursor='hand2')
-    img_label._photo = photo   # prevent GC
-    img_label.pack(padx=0, pady=0)
+    img = Image.open(path).convert('RGB')
+    iw, ih = img.size
+    if iw > width:
+        img = img.resize((width, int(ih * width / iw)), Image.LANCZOS)
+    elif iw < width:
+        # Scale up small images to fill the configured width
+        img = img.resize((width, int(ih * width / iw)), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    tk.Label(root, image=photo, bg='#2b2b2b', cursor='hand2').pack(padx=0, pady=0)
 except Exception as exc:
     print(f"popup: image load error: {exc}", file=sys.stderr)
 
@@ -98,100 +94,13 @@ w  = root.winfo_reqwidth()
 h  = root.winfo_reqheight()
 root.geometry(f'{w}x{h}+{sw - w - 20}+{sh - h - 60}')
 
-stop_event = threading.Event()
-
-def _dismiss():
-    stop_event.set()
-    root.destroy()
-
-root.bind('<Button-1>', lambda e: _dismiss())
-root.after(timeout, _dismiss)
+root.bind('<Button-1>', lambda e: root.destroy())
+root.after(timeout, root.destroy)
 
 try:
     os.unlink(path)
 except OSError:
     pass
-
-# --- live MJPEG stream -------------------------------------------------------
-
-def _update_frame(photo):
-    """Called on the tk main thread to swap in a new frame."""
-    if img_label is not None:
-        img_label._photo = photo
-        img_label.configure(image=photo)
-
-def _stream_loop():
-    import urllib.request
-
-    ctx = None
-    if not ssl_verify:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-    req = urllib.request.Request(camera_url)
-    if ha_token:
-        req.add_header('Authorization', f'Bearer {ha_token}')
-
-    try:
-        resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-    except Exception as exc:
-        print(f"popup: stream connect failed: {exc}", file=sys.stderr)
-        return
-
-    ct = resp.getheader('Content-Type', '')
-    boundary = None
-    for part in ct.split(';'):
-        p = part.strip()
-        if p.startswith('boundary='):
-            boundary = ('--' + p[9:].strip()).encode()
-            break
-
-    if not boundary:
-        print(f"popup: no MJPEG boundary in Content-Type: {ct!r}", file=sys.stderr)
-        return
-
-    buf = b''
-    while not stop_event.is_set():
-        try:
-            chunk = resp.read(8192)
-            if not chunk:
-                break
-            buf += chunk
-
-            # Extract complete parts between successive boundaries
-            while True:
-                b0 = buf.find(boundary)
-                if b0 == -1:
-                    break
-                b1 = buf.find(boundary, b0 + len(boundary))
-                if b1 == -1:
-                    break
-                part_data = buf[b0 + len(boundary): b1]
-                buf = buf[b1:]
-
-                hdr_end = part_data.find(b'\r\n\r\n')
-                if hdr_end == -1:
-                    continue
-                jpeg = part_data[hdr_end + 4:].rstrip()
-                if not jpeg.startswith(b'\xff\xd8'):
-                    continue   # not a valid JPEG
-
-                try:
-                    frame = _scale(Image.open(io.BytesIO(jpeg)).convert('RGB'))
-                    photo = ImageTk.PhotoImage(frame)
-                    root.after(0, _update_frame, photo)
-                except Exception:
-                    pass
-
-        except Exception as exc:
-            print(f"popup: stream read error: {exc}", file=sys.stderr)
-            break
-
-if camera_url and img_label is not None:
-    threading.Thread(target=_stream_loop, daemon=True).start()
-
-# -----------------------------------------------------------------------------
 
 root.mainloop()
 """
@@ -332,13 +241,10 @@ class Notifier:
     # -- custom image popup --------------------------------------------------
 
     def _show_image_popup(self, title: str, body: str, image_path: str,
-                          timeout_ms: int,
-                          camera_url: str | None = None) -> bool:
+                          timeout_ms: int) -> bool:
         """Launch a large custom popup window for the image in a subprocess.
 
         The subprocess takes ownership of *image_path* and unlinks it when done.
-        If *camera_url* is given, the popup streams live MJPEG frames after the
-        initial snapshot.
         Returns True if the subprocess was launched successfully.
         """
         import subprocess
@@ -350,9 +256,6 @@ class Notifier:
             "path": image_path,
             "width": self.cfg.image_popup_width,
             "timeout_ms": timeout_ms,
-            "camera_url": camera_url,
-            "ha_token": self.cfg.ha_token,
-            "ha_ssl_verify": self.cfg.ha_ssl_verify,
         })
         try:
             subprocess.Popen(
@@ -386,8 +289,7 @@ class Notifier:
     async def send(self, title: str, body: str,
                    image_url: str | None = None,
                    urgency: str | None = None,
-                   timeout_ms: int | None = None,
-                   camera_url: str | None = None):
+                   timeout_ms: int | None = None):
         urgency = urgency or self.cfg.default_urgency
         timeout_ms = timeout_ms if timeout_ms is not None else self.cfg.default_timeout_ms
 
@@ -399,7 +301,7 @@ class Notifier:
         # instead of the standard notification so the image appears at full size.
         if (image_path and self.cfg.image_popup_width > 0
                 and HAS_TKINTER and HAS_PILLOW):
-            if self._show_image_popup(title, body, image_path, timeout_ms, camera_url):
+            if self._show_image_popup(title, body, image_path, timeout_ms):
                 # Subprocess owns image_path cleanup; nothing left to do here.
                 return
 
@@ -468,17 +370,14 @@ class WebhookServer:
 
         # Convenience: pass camera_entity instead of full image_url
         camera_entity: str | None = data.get("camera_entity")
-        camera_url: str | None = None
-        if camera_entity:
-            if not image_url:
-                image_url = f"{self.cfg.ha_url}/api/camera_proxy/{camera_entity}"
-            camera_url = f"{self.cfg.ha_url}/api/camera_proxy_stream/{camera_entity}"
+        if camera_entity and not image_url:
+            image_url = f"{self.cfg.ha_url}/api/camera_proxy/{camera_entity}"
 
-        log.info("Notification: %r  image=%s  live_stream=%s", title, bool(image_url), bool(camera_url))
+        log.info("Notification: %r  image=%s", title, bool(image_url))
 
         # Fire and forget — respond immediately so HA doesn't time out
         asyncio.create_task(
-            self.notifier.send(title, message, image_url, urgency, timeout_ms, camera_url)
+            self.notifier.send(title, message, image_url, urgency, timeout_ms)
         )
         return web.Response(text="OK")
 

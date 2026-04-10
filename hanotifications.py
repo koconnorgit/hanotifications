@@ -46,7 +46,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 _POPUP_SCRIPT = r"""
-import sys, os, json
+import sys, os, json, webbrowser
 try:
     import tkinter as tk
     from PIL import Image, ImageTk
@@ -54,12 +54,13 @@ except ImportError as exc:
     print(f"popup: missing dependency: {exc}", file=sys.stderr)
     sys.exit(1)
 
-data     = json.loads(sys.argv[1])
-title    = data['title']
-body     = data['body']
-path     = data['path']
-width    = data['width']
-timeout  = data['timeout_ms']
+data       = json.loads(sys.argv[1])
+title      = data['title']
+body       = data['body']
+path       = data['path']
+width      = data['width']
+timeout    = data['timeout_ms']
+camera_url = data.get('camera_url')  # live stream URL, or None
 
 root = tk.Tk()
 root.title(title)
@@ -94,7 +95,12 @@ w  = root.winfo_reqwidth()
 h  = root.winfo_reqheight()
 root.geometry(f'{w}x{h}+{sw - w - 20}+{sh - h - 60}')
 
-root.bind('<Button-1>', lambda e: root.destroy())
+def on_click(e):
+    if camera_url:
+        webbrowser.open(camera_url)
+    root.destroy()
+
+root.bind('<Button-1>', on_click)
 root.after(timeout, root.destroy)
 
 try:
@@ -241,10 +247,11 @@ class Notifier:
     # -- custom image popup --------------------------------------------------
 
     def _show_image_popup(self, title: str, body: str, image_path: str,
-                          timeout_ms: int) -> bool:
+                          timeout_ms: int, camera_url: str | None = None) -> bool:
         """Launch a large custom popup window for the image in a subprocess.
 
         The subprocess takes ownership of *image_path* and unlinks it when done.
+        If *camera_url* is provided, clicking the popup opens it in the browser.
         Returns True if the subprocess was launched successfully.
         """
         import subprocess
@@ -256,6 +263,7 @@ class Notifier:
             "path": image_path,
             "width": self.cfg.image_popup_width,
             "timeout_ms": timeout_ms,
+            "camera_url": camera_url,
         })
         try:
             subprocess.Popen(
@@ -289,7 +297,8 @@ class Notifier:
     async def send(self, title: str, body: str,
                    image_url: str | None = None,
                    urgency: str | None = None,
-                   timeout_ms: int | None = None):
+                   timeout_ms: int | None = None,
+                   camera_url: str | None = None):
         urgency = urgency or self.cfg.default_urgency
         timeout_ms = timeout_ms if timeout_ms is not None else self.cfg.default_timeout_ms
 
@@ -301,7 +310,7 @@ class Notifier:
         # instead of the standard notification so the image appears at full size.
         if (image_path and self.cfg.image_popup_width > 0
                 and HAS_TKINTER and HAS_PILLOW):
-            if self._show_image_popup(title, body, image_path, timeout_ms):
+            if self._show_image_popup(title, body, image_path, timeout_ms, camera_url):
                 # Subprocess owns image_path cleanup; nothing left to do here.
                 return
 
@@ -370,14 +379,17 @@ class WebhookServer:
 
         # Convenience: pass camera_entity instead of full image_url
         camera_entity: str | None = data.get("camera_entity")
-        if camera_entity and not image_url:
-            image_url = f"{self.cfg.ha_url}/api/camera_proxy/{camera_entity}"
+        camera_url: str | None = None
+        if camera_entity:
+            if not image_url:
+                image_url = f"{self.cfg.ha_url}/api/camera_proxy/{camera_entity}"
+            camera_url = f"{self.cfg.ha_url}/api/camera_proxy_stream/{camera_entity}"
 
-        log.info("Notification: %r  image=%s", title, bool(image_url))
+        log.info("Notification: %r  image=%s  camera=%s", title, bool(image_url), bool(camera_url))
 
         # Fire and forget — respond immediately so HA doesn't time out
         asyncio.create_task(
-            self.notifier.send(title, message, image_url, urgency, timeout_ms)
+            self.notifier.send(title, message, image_url, urgency, timeout_ms, camera_url)
         )
         return web.Response(text="OK")
 

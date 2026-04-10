@@ -16,6 +16,7 @@ sudo pacman -S --needed --noconfirm \
     python-yaml \
     python-dbus \
     python-pillow \
+    tk \                # provides tkinter for the custom image popup window
     libnotify          # provides notify-send as fallback
 
 echo "==> Copying service files to $INSTALL_DIR ..."

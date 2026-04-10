@@ -34,6 +34,77 @@ try:
 except ImportError:
     HAS_PILLOW = False
 
+# Optional: tkinter for custom large-image popup windows
+try:
+    import tkinter as _tk_test; del _tk_test
+    HAS_TKINTER = True
+except Exception:
+    HAS_TKINTER = False
+
+# ---------------------------------------------------------------------------
+# Custom image popup script (run in a subprocess for isolation)
+# ---------------------------------------------------------------------------
+
+_POPUP_SCRIPT = r"""
+import sys, os, json
+try:
+    import tkinter as tk
+    from PIL import Image, ImageTk
+except ImportError as exc:
+    print(f"popup: missing dependency: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+data     = json.loads(sys.argv[1])
+title    = data['title']
+body     = data['body']
+path     = data['path']
+width    = data['width']
+timeout  = data['timeout_ms']
+
+root = tk.Tk()
+root.title(title)
+root.attributes('-topmost', True)
+root.configure(bg='#2b2b2b')
+root.resizable(False, False)
+
+try:
+    img = Image.open(path).convert('RGB')
+    iw, ih = img.size
+    if iw > width:
+        img = img.resize((width, int(ih * width / iw)), Image.LANCZOS)
+    elif iw < width:
+        # Scale up small images to fill the configured width
+        img = img.resize((width, int(ih * width / iw)), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    tk.Label(root, image=photo, bg='#2b2b2b', cursor='hand2').pack(padx=0, pady=0)
+except Exception as exc:
+    print(f"popup: image load error: {exc}", file=sys.stderr)
+
+tk.Label(root, text=title, fg='white', bg='#2b2b2b',
+         font=('Sans', 11, 'bold'), anchor='w').pack(fill='x', padx=10, pady=(6, 2))
+if body:
+    tk.Label(root, text=body, fg='#aaaaaa', bg='#2b2b2b',
+             font=('Sans', 10), wraplength=width - 20, anchor='w',
+             justify='left').pack(fill='x', padx=10, pady=(0, 8))
+
+root.update_idletasks()
+sw = root.winfo_screenwidth()
+sh = root.winfo_screenheight()
+w  = root.winfo_reqwidth()
+h  = root.winfo_reqheight()
+root.geometry(f'{w}x{h}+{sw - w - 20}+{sh - h - 60}')
+
+root.bind('<Button-1>', lambda e: root.destroy())
+root.after(timeout, root.destroy)
+
+try:
+    os.unlink(path)
+except OSError:
+    pass
+
+root.mainloop()
+"""
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -61,6 +132,8 @@ class Config:
         self.default_urgency: str = d.get("default_urgency", "normal")
         # Maximum dimension (px) when resizing images for D-Bus payload
         self.max_image_px: int = int(d.get("max_image_px", 512))
+        # Width (px) of the custom image popup window; 0 = use standard notification
+        self.image_popup_width: int = int(d.get("image_popup_width", 640))
         # When True, skip TLS verification for self-signed HA certs
         self.ha_ssl_verify: bool = bool(d.get("ha_ssl_verify", True))
 
@@ -165,6 +238,37 @@ class Notifier:
             log.warning("image-data encoding failed: %s", exc)
             hints["image-path"] = dbus.String(image_path)
 
+    # -- custom image popup --------------------------------------------------
+
+    def _show_image_popup(self, title: str, body: str, image_path: str,
+                          timeout_ms: int) -> bool:
+        """Launch a large custom popup window for the image in a subprocess.
+
+        The subprocess takes ownership of *image_path* and unlinks it when done.
+        Returns True if the subprocess was launched successfully.
+        """
+        import subprocess
+        import json
+
+        data = json.dumps({
+            "title": title,
+            "body": body,
+            "path": image_path,
+            "width": self.cfg.image_popup_width,
+            "timeout_ms": timeout_ms,
+        })
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c", _POPUP_SCRIPT, data],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            return True
+        except Exception as exc:
+            log.warning("Image popup launch failed: %s", exc)
+            return False
+
     # -- notify-send fallback ------------------------------------------------
 
     def _notify_send(self, title: str, body: str, image_path: str | None,
@@ -192,6 +296,14 @@ class Notifier:
         image_path: str | None = None
         if image_url:
             image_path = await self._fetch_image(image_url)
+
+        # When an image is present and the custom popup is enabled, use it
+        # instead of the standard notification so the image appears at full size.
+        if (image_path and self.cfg.image_popup_width > 0
+                and HAS_TKINTER and HAS_PILLOW):
+            if self._show_image_popup(title, body, image_path, timeout_ms):
+                # Subprocess owns image_path cleanup; nothing left to do here.
+                return
 
         try:
             if not self._dbus_send(title, body, image_path, urgency, timeout_ms):

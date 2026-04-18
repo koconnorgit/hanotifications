@@ -26,8 +26,9 @@ hanotifications  (aiohttp webhook server, systemd user service)
 
 - HA calls a local HTTP webhook with a JSON payload
 - The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then displays a notification
-- **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the screen, showing the image at configurable full width — much larger than a standard notification thumbnail
+- **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the primary monitor, showing the image at configurable full width — much larger than a standard notification thumbnail
 - **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
+- **Optional tray icon** — when `system_tray: true` is set, a Home Assistant icon appears in the KDE/Plasma system tray, blue when the HA server is reachable and grey when it is not. See [System tray icon](#system-tray-icon-optional) below.
 
 ---
 
@@ -40,6 +41,7 @@ hanotifications  (aiohttp webhook server, systemd user service)
 | `python-yaml` | yes | Config file parsing |
 | `python-pillow` | recommended | Image resizing for the custom popup (and D-Bus payload) |
 | `tk` | recommended | Custom large-image popup window (`python-tk` / `tk` package) |
+| `python-pyqt6` | optional | KDE/Plasma system tray icon (only used when `system_tray: true`) |
 | `python-dbus` | optional | D-Bus notifications with embedded images (text-only fallback if absent) |
 | `libnotify` | optional | `notify-send` fallback when D-Bus is unavailable |
 
@@ -135,6 +137,14 @@ max_image_px: 512
 # popup window is shown at this width instead of the standard notification.
 # Set to 0 to disable the custom popup and always use the standard notification.
 image_popup_width: 640
+
+# Show a Home Assistant icon in the KDE/Plasma system tray.
+# Blue when the HA server is reachable, grey when it is not.
+# Requires python-pyqt6.
+system_tray: false
+
+# Seconds between HA reachability checks used to color the tray icon.
+ha_check_interval_s: 30
 ```
 
 ---
@@ -283,6 +293,38 @@ curl -X POST http://127.0.0.1:8765/notify \
 # Health check (no auth required)
 curl http://127.0.0.1:8765/health
 ```
+
+---
+
+## System tray icon (optional)
+
+hanotifications can show a Home Assistant icon in the KDE/Plasma system tray that reflects HA reachability at a glance:
+
+- **Blue** house icon — the HA server responded to `GET {ha_url}/api/` within the poll interval
+- **Grey** house icon — the server did not respond (wrong URL, HA down, network issue, bad token, etc.)
+
+Right-clicking the icon shows the current reachability state and a **Quit** item that stops the webhook server.
+
+### Enabling
+
+Add to `~/.config/hanotifications/config.yaml`:
+
+```yaml
+system_tray: true          # show the tray icon
+ha_check_interval_s: 30    # seconds between HA reachability checks
+```
+
+Then restart the service:
+
+```bash
+systemctl --user restart hanotifications
+```
+
+### Requirements
+
+The tray icon requires `python-pyqt6`, which `install.sh` installs by default on Arch/CachyOS. If PyQt6 is missing the service logs a warning and continues without the tray; notifications still work normally.
+
+The reachability check calls `GET {ha_url}/api/` with your `ha_token` and a 5-second timeout. It is cheap and safe to run frequently; 30 seconds is a reasonable default.
 
 ---
 

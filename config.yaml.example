@@ -54,3 +54,15 @@ max_image_px: 512
 # default_timeout_ms. Click anywhere on the popup to dismiss it early.
 # Set to 0 to disable the custom popup and always use the standard notification.
 image_popup_width: 640
+
+# -------------------------------------------------------------------
+# System tray icon (KDE / Plasma)
+# -------------------------------------------------------------------
+
+# When true, show a Home Assistant icon in the system tray.
+# The icon is blue when the HA server is reachable and grey when it is not.
+# Requires python-pyqt6 (installed by install.sh).
+system_tray: false
+
+# Seconds between HA reachability checks used to color the tray icon.
+ha_check_interval_s: 30

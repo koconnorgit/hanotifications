@@ -7,17 +7,21 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hanotifications"
 SERVICE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 echo "==> Installing Python dependencies (pacman) ..."
-# python-aiohttp and python-yaml are in the Arch repos.
-# python-dbus (dbus-python) provides rich D-Bus notifications.
-# python-pillow enables embedded image previews in notifications.
+# python-aiohttp, python-yaml: webhook server + config parsing (required).
+# python-dbus:                 rich D-Bus notifications with embedded images.
+# python-pillow:               image resizing for D-Bus payload and popup.
+# tk:                          tkinter for the custom large-image popup.
+# python-pyqt6:                KDE/Plasma system tray icon (optional).
+# libnotify:                   notify-send fallback when D-Bus is unavailable.
 sudo pacman -S --needed --noconfirm \
     python \
     python-aiohttp \
     python-yaml \
     python-dbus \
     python-pillow \
-    tk \                # provides tkinter for the custom image popup window
-    libnotify          # provides notify-send as fallback
+    tk \
+    python-pyqt6 \
+    libnotify
 
 echo "==> Copying service files to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"

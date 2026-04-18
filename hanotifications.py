@@ -41,6 +41,15 @@ try:
 except Exception:
     HAS_TKINTER = False
 
+# Optional: PyQt6 for the KDE/Plasma system tray icon
+try:
+    from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPainterPath, QAction
+    from PyQt6.QtCore import QTimer, Qt, QObject, pyqtSignal
+    HAS_QT = True
+except ImportError:
+    HAS_QT = False
+
 # ---------------------------------------------------------------------------
 # Custom image popup script (run in a subprocess for isolation)
 # ---------------------------------------------------------------------------
@@ -61,8 +70,32 @@ path     = data['path']
 width    = data['width']
 timeout  = data['timeout_ms']
 
+def primary_screen_geom(tk_root):
+    # Returns (x, y, w, h) of the primary monitor. Prefers xrandr so we get
+    # per-monitor geometry on multi-head X11 setups (winfo_screenwidth() on
+    # X11 is the virtual-desktop span, which places popups on the wrong head).
+    import re, subprocess
+    try:
+        out = subprocess.check_output(
+            ['xrandr', '--query', '--current'],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode()
+        for line in out.splitlines():
+            if ' connected' in line and 'primary' in line.split()[:4]:
+                m = re.search(r'(\d+)x(\d+)\+(\d+)\+(\d+)', line)
+                if m:
+                    w, h, x, y = (int(v) for v in m.groups())
+                    return x, y, w, h
+    except Exception:
+        pass
+    return 0, 0, tk_root.winfo_screenwidth(), tk_root.winfo_screenheight()
+
+
 root = tk.Tk()
 root.title(title)
+# overrideredirect stops the window manager from re-centering or decorating
+# the popup, so the explicit geometry below is honored exactly.
+root.overrideredirect(True)
 root.attributes('-topmost', True)
 root.configure(bg='#2b2b2b')
 root.resizable(False, False)
@@ -88,11 +121,13 @@ if body:
              justify='left').pack(fill='x', padx=10, pady=(0, 8))
 
 root.update_idletasks()
-sw = root.winfo_screenwidth()
-sh = root.winfo_screenheight()
+px, py, pw, ph = primary_screen_geom(root)
 w  = root.winfo_reqwidth()
 h  = root.winfo_reqheight()
-root.geometry(f'{w}x{h}+{sw - w - 20}+{sh - h - 60}')
+# Bottom-right of primary screen, with margins above the KDE system tray.
+x = px + pw - w - 20
+y = py + ph - h - 60
+root.geometry(f'{w}x{h}+{x}+{y}')
 
 root.bind('<Button-1>', lambda e: root.destroy())
 root.after(timeout, root.destroy)
@@ -136,6 +171,10 @@ class Config:
         self.image_popup_width: int = int(d.get("image_popup_width", 640))
         # When True, skip TLS verification for self-signed HA certs
         self.ha_ssl_verify: bool = bool(d.get("ha_ssl_verify", True))
+        # Show a KDE/Plasma system tray icon indicating HA reachability
+        self.system_tray: bool = bool(d.get("system_tray", False))
+        # Seconds between HA reachability checks for the tray icon
+        self.ha_check_interval_s: int = int(d.get("ha_check_interval_s", 30))
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +356,144 @@ class Notifier:
 
 
 # ---------------------------------------------------------------------------
+# System tray icon (optional, KDE/Plasma)
+# ---------------------------------------------------------------------------
+
+_HA_BLUE = "#18BCF2"
+_HA_GREY = "#888888"
+
+
+def _render_ha_icon(color: str, size: int = 64) -> "QIcon":
+    """Draw a Home-Assistant-style house glyph in the given color."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(QColor(color)))
+
+    s = size / 64.0
+    path = QPainterPath()
+    path.moveTo(32 * s, 5 * s)
+    path.lineTo(59 * s, 29 * s)
+    path.lineTo(53 * s, 29 * s)
+    path.lineTo(53 * s, 58 * s)
+    path.lineTo(11 * s, 58 * s)
+    path.lineTo(11 * s, 29 * s)
+    path.lineTo(5 * s, 29 * s)
+    path.closeSubpath()
+    painter.drawPath(path)
+
+    # White "H" monogram on the house
+    painter.setBrush(QBrush(QColor("white")))
+    painter.drawRect(int(22 * s), int(32 * s), max(1, int(5 * s)), int(18 * s))
+    painter.drawRect(int(37 * s), int(32 * s), max(1, int(5 * s)), int(18 * s))
+    painter.drawRect(int(22 * s), int(39 * s), int(20 * s), max(1, int(4 * s)))
+    painter.end()
+    return QIcon(pm)
+
+
+def _check_ha_reachable(cfg: Config) -> bool:
+    """Synchronous reachability check used by the tray poller."""
+    import ssl
+    import urllib.request
+
+    if not cfg.ha_url:
+        return False
+
+    ctx = None
+    if cfg.ha_url.startswith("https") and not cfg.ha_ssl_verify:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(f"{cfg.ha_url}/api/")
+    if cfg.ha_token:
+        req.add_header("Authorization", f"Bearer {cfg.ha_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+class SystemTray:
+    """KDE/Plasma system tray icon showing HA reachability.
+
+    Runs a Qt event loop on the calling thread. The reachability check runs
+    in a short-lived worker thread and delivers its result via a Qt signal.
+    """
+
+    def __init__(self, cfg: Config, on_quit):
+        self.cfg = cfg
+        self._on_quit = on_quit
+
+    def run(self):
+        import threading
+
+        app = QApplication(sys.argv[:1])
+        app.setQuitOnLastWindowClosed(False)
+        app.setApplicationName("hanotifications")
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            log.warning("System tray not available on this session — tray disabled")
+            return
+
+        icon_blue = _render_ha_icon(_HA_BLUE)
+        icon_grey = _render_ha_icon(_HA_GREY)
+
+        tray = QSystemTrayIcon()
+        tray.setIcon(icon_grey)
+        tray.setToolTip("hanotifications — checking Home Assistant…")
+
+        menu = QMenu()
+        status = QAction("HA: checking…")
+        status.setEnabled(False)
+        menu.addAction(status)
+        menu.addSeparator()
+        quit_act = QAction("Quit")
+        menu.addAction(quit_act)
+        tray.setContextMenu(menu)
+        tray.show()
+
+        class _Signals(QObject):
+            result = pyqtSignal(bool)
+        sig = _Signals()
+
+        def apply(reachable: bool):
+            if reachable:
+                tray.setIcon(icon_blue)
+                tray.setToolTip(f"hanotifications — Home Assistant reachable ({self.cfg.ha_url})")
+                status.setText("HA: reachable")
+            else:
+                tray.setIcon(icon_grey)
+                tray.setToolTip(f"hanotifications — Home Assistant unreachable ({self.cfg.ha_url})")
+                status.setText("HA: unreachable")
+
+        sig.result.connect(apply)
+
+        def poll():
+            def worker():
+                ok = _check_ha_reachable(self.cfg)
+                sig.result.emit(ok)
+            threading.Thread(target=worker, daemon=True).start()
+
+        timer = QTimer()
+        timer.timeout.connect(poll)
+        timer.start(max(5, self.cfg.ha_check_interval_s) * 1000)
+        poll()  # initial check
+
+        def do_quit():
+            try:
+                self._on_quit()
+            finally:
+                app.quit()
+        quit_act.triggered.connect(do_quit)
+
+        app.exec()
+
+
+# ---------------------------------------------------------------------------
 # Webhook server
 # ---------------------------------------------------------------------------
 
@@ -402,7 +579,23 @@ def default_config_path() -> str:
     return os.path.join(xdg, "hanotifications", "config.yaml")
 
 
-async def run():
+async def run_server(cfg: Config, notifier: Notifier, stop: asyncio.Event):
+    server = WebhookServer(cfg, notifier)
+    app = server.build_app()
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, cfg.host, cfg.port)
+    await site.start()
+    log.info("Ready.")
+
+    try:
+        await stop.wait()
+    finally:
+        await runner.cleanup()
+
+
+def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else default_config_path()
 
     if not os.path.exists(config_path):
@@ -412,8 +605,6 @@ async def run():
 
     cfg = Config(config_path)
     notifier = Notifier(cfg)
-    server = WebhookServer(cfg, notifier)
-    app = server.build_app()
 
     log.info("hanotifications starting on %s:%s", cfg.host, cfg.port)
     if not HAS_DBUS:
@@ -421,17 +612,50 @@ async def run():
     if not HAS_PILLOW:
         log.warning("Pillow not found — images sent as icon path only (no embedded preview)")
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, cfg.host, cfg.port)
-    await site.start()
-    log.info("Ready.")
+    tray_enabled = cfg.system_tray and HAS_QT
+    if cfg.system_tray and not HAS_QT:
+        log.warning("system_tray=true but PyQt6 is not installed — tray icon disabled")
+
+    if not tray_enabled:
+        try:
+            asyncio.run(run_server(cfg, notifier, asyncio.Event()))
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # Qt must own the main thread; run the aiohttp server on a background thread.
+    import threading
+
+    loop = asyncio.new_event_loop()
+    stop_event: asyncio.Event | None = None
+    ready = threading.Event()
+
+    def asyncio_thread():
+        nonlocal stop_event
+        asyncio.set_event_loop(loop)
+        stop_event = asyncio.Event()
+        ready.set()
+        try:
+            loop.run_until_complete(run_server(cfg, notifier, stop_event))
+        except Exception as exc:
+            log.error("Webhook server crashed: %s", exc)
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=asyncio_thread, name="hanotif-server", daemon=True)
+    t.start()
+    ready.wait()
+
+    def on_quit():
+        log.info("Tray quit requested — stopping webhook server")
+        loop.call_soon_threadsafe(stop_event.set)
+        t.join(timeout=5)
 
     try:
-        await asyncio.Event().wait()  # run forever
-    finally:
-        await runner.cleanup()
+        SystemTray(cfg, on_quit).run()
+    except KeyboardInterrupt:
+        on_quit()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    main()

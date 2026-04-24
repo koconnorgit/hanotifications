@@ -238,7 +238,7 @@ class Notifier:
                                  "/org/freedesktop/Notifications")
             iface = dbus.Interface(obj, "org.freedesktop.Notifications")
             iface.Notify(
-                "hanotifications",          # app_name
+                "Home Assistant Notification",  # app_name
                 dbus.UInt32(0),             # replaces_id (0 = new)
                 dbus.String(""),            # app_icon
                 dbus.String(title),
@@ -313,7 +313,7 @@ class Notifier:
     def _notify_send(self, title: str, body: str, image_path: str | None,
                      urgency: str, timeout_ms: int):
         import subprocess
-        cmd = ["notify-send", "-a", "hanotifications",
+        cmd = ["notify-send", "-a", "Home Assistant Notification",
                "-u", urgency, "-t", str(timeout_ms)]
         if image_path:
             cmd += ["-i", image_path]

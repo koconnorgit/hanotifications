@@ -326,6 +326,21 @@ The tray icon requires `python-pyqt6`, which `install.sh` installs by default on
 
 The reachability check calls `GET {ha_url}/api/` with your `ha_token` and a 5-second timeout. It is cheap and safe to run frequently; 30 seconds is a reasonable default.
 
+### Inbound heartbeat (optional)
+
+The outbound check above catches failures where this machine can't reach HA. To also catch the other direction — HA is up but can no longer reach this host (firewall change, network move, broken automation) — enable the inbound heartbeat.
+
+When `heartbeat_required: true`, the tray also goes grey if HA has not POSTed to `/heartbeat` within `heartbeat_grace_s` seconds. The default 90-second grace pairs with a 60-second HA cadence and tolerates one missed beat.
+
+Add the heartbeat `rest_command` and automation from `ha_examples/rest_command.yaml` and `ha_examples/automations.yaml` to your HA config, then flip the flag:
+
+```yaml
+heartbeat_required: true
+heartbeat_grace_s: 90
+```
+
+Right-clicking the tray icon distinguishes the failure modes — `outbound unreachable`, `no heartbeat (Ns)`, or `unreachable` (both) — so you can tell which leg broke.
+
 ---
 
 ## Service management

@@ -10,8 +10,10 @@ from the HA API.
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -19,6 +21,7 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+from aiohttp.abc import AbstractAccessLogger
 import yaml
 
 # Optional: rich D-Bus notifications with embedded image data
@@ -52,6 +55,47 @@ except ImportError:
     HAS_QT = False
 
 # ---------------------------------------------------------------------------
+# HTML page served by /viewer — plays HA's LL-HLS stream via hls.js, which
+# (unlike ffmpeg) speaks EXT-X-PART and can approach HA's ~2s live edge.
+# ---------------------------------------------------------------------------
+
+_VIEWER_HTML = '''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- Block Referer so the URL-embedded token never leaks to the hls.js CDN
+     (or anywhere else the page might reach out to). -->
+<meta name="referrer" content="no-referrer">
+<title>%%TITLE%%</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; }
+  video { width: 100vw; height: 100vh; object-fit: contain; background: #000; }
+</style>
+</head>
+<body>
+<video id="v" autoplay muted controls playsinline></video>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"
+        referrerpolicy="no-referrer"></script>
+<script>
+  const v = document.getElementById('v');
+  const src = %%SRC_JSON%%;
+  // muted is required for autoplay on fresh-tab loads (no user gesture).
+  // Users can unmute via the controls; the stream keeps playing.
+  if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls({ lowLatencyMode: true, liveSyncDurationCount: 1 });
+    hls.loadSource(src);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { v.play().catch(() => {}); });
+  } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    v.src = src;
+    v.addEventListener('loadedmetadata', () => { v.play().catch(() => {}); });
+  }
+</script>
+</body>
+</html>
+'''
+
+# ---------------------------------------------------------------------------
 # Custom image popup script (run in a subprocess for isolation)
 # ---------------------------------------------------------------------------
 
@@ -78,6 +122,8 @@ timeout           = data['timeout_ms']
 live_stream_url   = data.get('live_stream_url')
 live_stream_player = data.get('live_stream_player', 'mpv')
 live_stream_fps   = data.get('live_stream_fps', 2)
+live_stream_mode  = data.get('live_stream_mode', 'mpv')
+viewer_url        = data.get('viewer_url')
 ha_url            = data.get('ha_url', '')
 ha_token          = data.get('ha_token', '')
 ssl_verify        = data.get('ha_ssl_verify', True)
@@ -125,8 +171,30 @@ def fetch_hls_url():
         return None
 
 
+def launch_browser_view():
+    '''Open the daemon's /viewer page in the default browser.
+
+    That page pulls a signed HLS URL from HA and plays it via hls.js, which
+    (unlike ffmpeg) speaks EXT-X-PART and reaches HA's ~2s LL-HLS floor.
+    URL is prebuilt by the daemon and includes the webhook token.
+    '''
+    if not viewer_url:
+        print("popup: browser mode but daemon provided no viewer_url",
+              file=sys.stderr)
+        return
+    try:
+        subprocess.Popen(['xdg-open', viewer_url], start_new_session=True,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception as exc:
+        print(f"popup: xdg-open failed: {exc}", file=sys.stderr)
+
+
 def launch_live_stream():
     if not live_stream_url:
+        return
+    if live_stream_mode == 'browser':
+        launch_browser_view()
         return
     player = shutil.which(live_stream_player) if live_stream_player else None
     if not player:
@@ -159,7 +227,24 @@ def launch_live_stream():
                 fh.write('tls-verify=no\n')
 
     args = [player, '--mute=yes', '--force-window=yes', f'--title={title}']
-    if not use_hls:
+    if use_hls:
+        # HA emits LL-HLS with 10s full segments + 0.9s EXT-X-PART chunks.
+        # ffmpeg's HLS demuxer ignores parts (as of 8.x), so the best we
+        # can do is honor HA's EXT-X-START:TIME-OFFSET=-2.000,PRECISE=YES
+        # tag via prefer_x_start, which starts us ~2s inside the last
+        # segment instead of at its beginning (=10s behind). Paired with
+        # aggressive buffer-reduction flags so we stay near the live edge.
+        # These flags are safe on HLS (real PTS); they broke MJPEG where
+        # timestamps are synthesized, which is why the MJPEG branch keeps
+        # its own tuning. Floor on this path is ~2s — HA's PART-HOLD-BACK;
+        # beating it requires hls.js-style part support or WebRTC/go2rtc.
+        args.extend(['--profile=low-latency',
+                     '--demuxer-lavf-o-add=prefer_x_start=1',
+                     '--demuxer-lavf-o-add=live_start_index=-1',
+                     '--cache=no',
+                     '--demuxer-readahead-secs=0',
+                     '--framedrop=decoder'])
+    else:
         # MJPEG has no PTS or framerate metadata; pin playback to HA's
         # snapshot rate so mpv doesn't fast-forward through a buffer.
         args.extend(['--no-correct-pts',
@@ -312,6 +397,12 @@ class Config:
         # play in fast-forward bursts. HA's camera_proxy_stream is typically
         # ~2fps. Raise for faster cameras, lower if playback still runs ahead.
         self.live_stream_fps: float = float(d.get("live_stream_fps", 2))
+        # "mpv" (default) launches the configured player on an HLS/MJPEG
+        # stream. "browser" opens HA's more-info dialog via xdg-open, which
+        # renders the camera using hls.js (LL-HLS part-aware) matching HA's
+        # own UI latency. Browser mode requires an active HA login in the
+        # default browser.
+        self.live_stream_mode: str = d.get("live_stream_mode", "mpv")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +429,55 @@ class HealthState:
         return time.time() - self.last_heartbeat_ts
 
 
+class ViewerTokens:
+    """Short-lived entity-bound tokens for the /viewer endpoint.
+
+    The daemon issues one at notification time and embeds it in the popup's
+    viewer URL, so the webhook_secret never touches the browser — and thus
+    can't leak via browser history, the Referer header sent to the hls.js
+    CDN, or xdg-open's argv. A TTL (no single-use) avoids 403s on refresh
+    or prefetch, while still bounding long-term exposure.
+    """
+    TTL_SECS = 300  # 5 minutes: covers realistic click delays.
+
+    def __init__(self):
+        self._tokens: dict[str, tuple[float, str]] = {}  # token -> (expiry, entity)
+
+    def issue(self, entity: str) -> str:
+        import secrets
+        now = time.time()
+        # Opportunistic prune so the dict can't grow unbounded.
+        self._tokens = {t: v for t, v in self._tokens.items() if v[0] > now}
+        token = secrets.token_urlsafe(24)
+        self._tokens[token] = (now + self.TTL_SECS, entity)
+        return token
+
+    def validate(self, token: str, entity: str) -> bool:
+        entry = self._tokens.get(token)
+        if not entry:
+            return False
+        expiry, ent = entry
+        return time.time() <= expiry and ent == entity
+
+
+# Redacts `token=<value>` query params in request URLs before they hit the
+# journal. The viewer token is short-lived so leakage is already bounded,
+# but there's no reason for the secret-shaped value to live in logs at all.
+_TOKEN_LOG_RE = re.compile(r"([?&](?:token|access_token)=)[^&\s]+")
+
+
+class _MaskingAccessLogger(AbstractAccessLogger):
+    """aiohttp access logger that masks auth tokens in the request line."""
+    def log(self, request, response, time):
+        path = _TOKEN_LOG_RE.sub(r"\1<redacted>", request.path_qs)
+        self.logger.info(
+            '%s "%s %s HTTP/%d.%d" %d %s',
+            request.remote, request.method, path,
+            request.version.major, request.version.minor,
+            response.status, response.body_length,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Notification sender
 # ---------------------------------------------------------------------------
@@ -346,8 +486,9 @@ _URGENCY = {"low": 0, "normal": 1, "critical": 2}
 
 
 class Notifier:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, viewer_tokens: "ViewerTokens | None" = None):
         self.cfg = config
+        self.viewer_tokens = viewer_tokens
 
     # -- image fetching ------------------------------------------------------
 
@@ -466,11 +607,27 @@ class Notifier:
             payload["live_stream_url"] = live_stream_url
             payload["live_stream_player"] = self.cfg.live_stream_player
             payload["live_stream_fps"] = self.cfg.live_stream_fps
+            payload["live_stream_mode"] = self.cfg.live_stream_mode
             payload["ha_url"] = self.cfg.ha_url
             payload["ha_token"] = self.cfg.ha_token
             payload["ha_ssl_verify"] = self.cfg.ha_ssl_verify
             if camera_entity:
                 payload["camera_entity"] = camera_entity
+            # Browser mode: point xdg-open at our own /viewer endpoint,
+            # which serves hls.js and the signed HA HLS URL. 127.0.0.1 so
+            # it works regardless of whether the daemon binds loopback or
+            # 0.0.0.0. Auth uses a short-lived entity-bound viewer token,
+            # NOT webhook_secret, so the URL (visible in browser history,
+            # ps argv, etc.) carries nothing reusable after the TTL.
+            if (self.cfg.live_stream_mode == "browser" and camera_entity
+                    and self.viewer_tokens is not None):
+                from urllib.parse import quote
+                vt = self.viewer_tokens.issue(camera_entity)
+                payload["viewer_url"] = (
+                    f"http://127.0.0.1:{self.cfg.port}/viewer"
+                    f"?token={vt}"
+                    f"&entity={quote(camera_entity)}"
+                )
         data = json.dumps(payload)
         try:
             # Inherit stderr so popup-subprocess warnings (HLS fetch failures,
@@ -722,10 +879,12 @@ class SystemTray:
 # ---------------------------------------------------------------------------
 
 class WebhookServer:
-    def __init__(self, config: Config, notifier: Notifier, health: HealthState):
+    def __init__(self, config: Config, notifier: Notifier, health: HealthState,
+                 viewer_tokens: ViewerTokens):
         self.cfg = config
         self.notifier = notifier
         self.health = health
+        self.viewer_tokens = viewer_tokens
 
     # -- auth ----------------------------------------------------------------
 
@@ -804,6 +963,67 @@ class WebhookServer:
         self.health.stamp_heartbeat()
         return web.Response(text="OK")
 
+    async def _fetch_hls_url(self, entity: str) -> str | None:
+        """HA WS handshake -> signed HLS path. None on any failure.
+
+        Same dance as the popup subprocess does for mpv, but run here so the
+        browser viewer gets the signed URL inline in the HTML response.
+        """
+        ws_url = self.cfg.ha_url.rstrip('/').replace('http', 'ws', 1) + '/api/websocket'
+        ssl_arg = None if self.cfg.ha_ssl_verify else False
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as session:
+                async with session.ws_connect(ws_url, ssl=ssl_arg) as ws:
+                    hello = await ws.receive_json()
+                    if hello.get('type') != 'auth_required':
+                        return None
+                    await ws.send_json({'type': 'auth',
+                                        'access_token': self.cfg.ha_token})
+                    ok = await ws.receive_json()
+                    if ok.get('type') != 'auth_ok':
+                        return None
+                    await ws.send_json({'id': 1, 'type': 'camera/stream',
+                                        'entity_id': entity, 'format': 'hls'})
+                    resp = await ws.receive_json()
+                    if not resp.get('success'):
+                        log.warning("camera/stream failed: %s", resp)
+                        return None
+                    return resp.get('result', {}).get('url')
+        except Exception as exc:
+            log.warning("HLS fetch failed for %s: %s", entity, exc)
+            return None
+
+    async def handle_viewer(self, request: web.Request) -> web.Response:
+        """Serve a tiny HTML page that plays the camera's LL-HLS stream
+        via hls.js (which, unlike ffmpeg, supports EXT-X-PART).
+
+        Auth: `token` query param must be an entity-bound viewer token
+        previously issued for this entity. Plain query string rather than
+        an Authorization header because the browser loads this URL from
+        an xdg-open spawn. The token is short-lived, so even if it leaks
+        via browser history it's useless well before anyone sees it.
+        """
+        entity = request.query.get("entity", "")
+        token = request.query.get("token", "")
+        if not self.viewer_tokens.validate(token, entity):
+            return web.Response(status=403, text="Forbidden")
+        if not entity.startswith("camera."):
+            return web.Response(status=400, text="Bad entity")
+
+        hls_path = await self._fetch_hls_url(entity)
+        if not hls_path:
+            return web.Response(status=502, text="Stream init failed")
+
+        abs_hls = self.cfg.ha_url.rstrip("/") + hls_path
+        page = _VIEWER_HTML.replace("%%TITLE%%", entity) \
+                           .replace("%%SRC_JSON%%", json.dumps(abs_hls))
+        # no-store keeps the page (and embedded signed HLS URL) out of the
+        # browser's back-button cache / disk cache.
+        return web.Response(text=page, content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+
     # -- app -----------------------------------------------------------------
 
     def build_app(self) -> web.Application:
@@ -811,6 +1031,7 @@ class WebhookServer:
         app.router.add_post("/notify", self.handle_notify)
         app.router.add_get("/health", self.handle_health)
         app.router.add_post("/heartbeat", self.handle_heartbeat)
+        app.router.add_get("/viewer", self.handle_viewer)
         return app
 
 
@@ -824,11 +1045,11 @@ def default_config_path() -> str:
 
 
 async def run_server(cfg: Config, notifier: Notifier, health: HealthState,
-                     stop: asyncio.Event):
-    server = WebhookServer(cfg, notifier, health)
+                     viewer_tokens: ViewerTokens, stop: asyncio.Event):
+    server = WebhookServer(cfg, notifier, health, viewer_tokens)
     app = server.build_app()
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log_class=_MaskingAccessLogger)
     await runner.setup()
     site = web.TCPSite(runner, cfg.host, cfg.port)
     await site.start()
@@ -849,7 +1070,8 @@ def main():
         sys.exit(1)
 
     cfg = Config(config_path)
-    notifier = Notifier(cfg)
+    viewer_tokens = ViewerTokens()
+    notifier = Notifier(cfg, viewer_tokens)
     health = HealthState()
 
     log.info("hanotifications starting on %s:%s", cfg.host, cfg.port)
@@ -864,7 +1086,8 @@ def main():
 
     if not tray_enabled:
         try:
-            asyncio.run(run_server(cfg, notifier, health, asyncio.Event()))
+            asyncio.run(run_server(cfg, notifier, health, viewer_tokens,
+                                   asyncio.Event()))
         except KeyboardInterrupt:
             pass
         return
@@ -882,7 +1105,8 @@ def main():
         stop_event = asyncio.Event()
         ready.set()
         try:
-            loop.run_until_complete(run_server(cfg, notifier, health, stop_event))
+            loop.run_until_complete(run_server(cfg, notifier, health,
+                                                viewer_tokens, stop_event))
         except Exception as exc:
             log.error("Webhook server crashed: %s", exc)
         finally:

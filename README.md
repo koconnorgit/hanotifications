@@ -293,10 +293,10 @@ More examples are in [`ha_examples/automations.yaml`](ha_examples/automations.ya
 
 When a notification includes `camera_entity`, clicking the snapshot popup opens the live feed in a standalone `mpv` window alongside dismissing the popup. Auto-dismiss on timeout does **not** launch the player — only an explicit click. Controlled by `live_stream_on_click` (default `true`); the feature no-ops gracefully if `mpv` is not installed.
 
-The popup tries two stream sources, in order:
+Two launch modes, controlled by `live_stream_mode`:
 
-1. **HLS via HA's stream integration** (preferred). On click, the popup does a short WebSocket handshake against `/api/websocket`, authenticates with your `ha_token`, and calls `camera/stream` with `format: hls` — HA returns a short-lived signed URL like `/api/hls/<token>/master_playlist.m3u8` that mpv plays directly. This gives the camera's real native framerate and audio when the camera provides it. Requires HA's `stream` integration (enabled by default via `default_config:`) and a camera that supports HLS output.
-2. **MJPEG from `/api/camera_proxy_stream/{entity}`** (fallback). Used when the WS handshake fails or the camera can't produce HLS. HA's MJPEG endpoint is snapshot polling, typically **~2 fps regardless of your camera's native rate**. `live_stream_fps` (default `2`) pins mpv to that rate so it doesn't fast-forward through a no-PTS stream.
+- **`mpv` (default)** — launches `mpv` on the stream directly. Tries HLS first via HA's stream integration (WebSocket `camera/stream` handshake → signed HLS URL), falls back to MJPEG from `/api/camera_proxy_stream/{entity}` if the handshake fails. Drawback: ffmpeg's HLS demuxer (what mpv uses) doesn't speak LL-HLS parts, so live latency floor is HA's segment duration — typically ~10 s. MJPEG fallback is ~2 fps snapshot polling, pinned via `live_stream_fps`.
+- **`browser`** — `xdg-open`s a page served by the daemon at `/viewer` which plays the same HLS via `hls.js` in your default browser. `hls.js` **does** speak `EXT-X-PART`, so latency matches HA's own UI (~2 s). The viewer page lives fully on your loopback (`127.0.0.1:{port}`); the browser tab loads `hls.js` from the jsDelivr CDN. The `/viewer` endpoint is gated by a short-lived (5 min) per-notification token so the `webhook_secret` never ends up in the browser URL, history, or Referer headers. The daemon's access log also masks `token=…` values.
 
 The window starts muted so a motion alert doesn't suddenly play sound — press `m` or click the mute button in mpv's on-screen controls to unmute.
 

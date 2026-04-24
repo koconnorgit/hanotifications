@@ -45,7 +45,7 @@ except Exception:
 # Optional: PyQt6 for the KDE/Plasma system tray icon
 try:
     from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
-    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPainterPath, QAction
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPainterPath, QPen, QAction
     from PyQt6.QtCore import QTimer, Qt, QObject, pyqtSignal
     HAS_QT = True
 except ImportError:
@@ -392,10 +392,15 @@ class Notifier:
 
 _HA_BLUE = "#18BCF2"
 _HA_GREY = "#888888"
+_HA_SLASH_RED = "#FF3B30"
 
 
-def _render_ha_icon(color: str, size: int = 64) -> "QIcon":
-    """Draw a Home-Assistant-style house glyph in the given color."""
+def _render_ha_icon(color: str, size: int = 64, disconnected: bool = False) -> "QIcon":
+    """Draw a Home-Assistant-style house glyph in the given color.
+
+    When disconnected=True, overlays a thin red diagonal slash across the
+    whole icon (bottom-left → top-right) to make the offline state obvious.
+    """
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
@@ -420,6 +425,15 @@ def _render_ha_icon(color: str, size: int = 64) -> "QIcon":
     painter.drawRect(int(22 * s), int(32 * s), max(1, int(5 * s)), int(18 * s))
     painter.drawRect(int(37 * s), int(32 * s), max(1, int(5 * s)), int(18 * s))
     painter.drawRect(int(22 * s), int(39 * s), int(20 * s), max(1, int(4 * s)))
+
+    if disconnected:
+        pen = QPen(QColor(_HA_SLASH_RED))
+        pen.setWidthF(max(2.0, 3.0 * s))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(int(4 * s), int(60 * s), int(60 * s), int(4 * s))
+
     painter.end()
     return QIcon(pm)
 
@@ -472,7 +486,7 @@ class SystemTray:
             return
 
         icon_blue = _render_ha_icon(_HA_BLUE)
-        icon_grey = _render_ha_icon(_HA_GREY)
+        icon_grey = _render_ha_icon(_HA_GREY, disconnected=True)
 
         tray = QSystemTrayIcon()
         tray.setIcon(icon_grey)

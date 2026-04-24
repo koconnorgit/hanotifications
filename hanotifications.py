@@ -944,6 +944,15 @@ class WebhookServer:
         log.info("Notification: %r  image=%s  live=%s",
                  title, bool(image_url), bool(live_stream_url))
 
+        # Pre-warm HA's stream worker now so the first segment is already
+        # being written by the time the user clicks the popup. HA's stream
+        # cold-start (FFmpeg spinning up against the source RTSP) is the
+        # bulk of the click-to-play delay; firing camera/stream here pays
+        # that cost in the background. HA dedupes concurrent stream
+        # requests, so the later /viewer fetch reuses the same worker.
+        if camera_entity and self.cfg.live_stream_mode == "browser":
+            asyncio.create_task(self._fetch_hls_url(camera_entity))
+
         # Fire and forget — respond immediately so HA doesn't time out
         asyncio.create_task(
             self.notifier.send(title, message, image_url, urgency, timeout_ms,

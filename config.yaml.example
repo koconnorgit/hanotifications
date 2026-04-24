@@ -66,6 +66,15 @@ live_stream_on_click: true
 # only makes sense if the replacement accepts the same flags.
 live_stream_player: "mpv"
 
+# How the live stream is launched when the popup is clicked.
+#   "mpv"     — the configured live_stream_player; HLS via ffmpeg (which can't
+#                do LL-HLS parts, so latency floor is the HA segment duration,
+#                typically ~10 s), MJPEG fallback.
+#   "browser" — xdg-open a viewer page the daemon serves at /viewer that plays
+#                the same HLS via hls.js in your default browser. hls.js speaks
+#                EXT-X-PART so latency matches HA's UI (~2 s).
+live_stream_mode: "mpv"
+
 # Frames-per-second hint for the MJPEG stream. MJPEG has no framerate metadata,
 # so mpv defaults to 25 fps — which makes low-fps HA cameras play in
 # fast-forward bursts. HA's camera_proxy_stream is typically ~2 fps. Raise for

@@ -397,11 +397,10 @@ class Config:
         # play in fast-forward bursts. HA's camera_proxy_stream is typically
         # ~2fps. Raise for faster cameras, lower if playback still runs ahead.
         self.live_stream_fps: float = float(d.get("live_stream_fps", 2))
-        # "mpv" (default) launches the configured player on an HLS/MJPEG
-        # stream. "browser" opens HA's more-info dialog via xdg-open, which
-        # renders the camera using hls.js (LL-HLS part-aware) matching HA's
-        # own UI latency. Browser mode requires an active HA login in the
-        # default browser.
+        # "mpv" (default) launches the configured player on an HLS stream
+        # (MJPEG fallback if the HA WS handshake fails). "browser" xdg-opens
+        # the daemon's /viewer page, which plays the same HLS via hls.js —
+        # part-aware, so it matches HA's own UI ~2s latency.
         self.live_stream_mode: str = d.get("live_stream_mode", "mpv")
 
 

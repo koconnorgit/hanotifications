@@ -19,3 +19,13 @@ rest_command:
         {% if image_url is defined %}, "image_url": "{{ image_url }}"{% endif %}
         {% if camera_entity is defined %}, "camera_entity": "{{ camera_entity }}"{% endif %}
       }
+
+  # Used by the heartbeat automation below to prove to hanotifications that
+  # HA can still reach it. If this stops firing, the tray icon goes grey.
+  hanotifications_heartbeat:
+    url: "http://127.0.0.1:8765/heartbeat"
+    method: POST
+    headers:
+      Authorization: "Bearer change-me-to-a-random-string"
+      Content-Type: "application/json"
+    payload: "{}"

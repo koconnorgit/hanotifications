@@ -68,3 +68,14 @@
         message: "Smoke detected in the house!"
         urgency: "critical"
         timeout_ms: 0   # 0 = do not auto-dismiss
+
+# ---------------------------------------------------------------------------
+# 5. Heartbeat — fires every 60s so hanotifications knows HA can reach it.
+#     Pair with heartbeat_required: true in config.yaml (grace window 90s).
+# ---------------------------------------------------------------------------
+- alias: "hanotifications heartbeat"
+  trigger:
+    - platform: time_pattern
+      seconds: "/60"
+  action:
+    - service: rest_command.hanotifications_heartbeat

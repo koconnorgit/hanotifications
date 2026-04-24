@@ -66,3 +66,17 @@ system_tray: false
 
 # Seconds between HA reachability checks used to color the tray icon.
 ha_check_interval_s: 30
+
+# Inbound heartbeat: when true, the tray also goes grey if Home Assistant
+# has not POSTed to /heartbeat within heartbeat_grace_s seconds. This catches
+# failures the outbound check can't — e.g. HA is up but can no longer reach
+# this host (firewall change, daemon host moved, HA automation broken).
+#
+# Requires an HA automation that calls the hanotifications_heartbeat
+# rest_command every 60 seconds. See ha_examples/ for a ready-to-paste
+# configuration. Leave false if you haven't set that up.
+heartbeat_required: false
+
+# Maximum age (seconds) of the last heartbeat before the link is considered
+# stale. The default 90s pairs with a 60s HA cadence and tolerates one miss.
+heartbeat_grace_s: 90

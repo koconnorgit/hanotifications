@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import aiohttp
@@ -175,6 +176,36 @@ class Config:
         self.system_tray: bool = bool(d.get("system_tray", False))
         # Seconds between HA reachability checks for the tray icon
         self.ha_check_interval_s: int = int(d.get("ha_check_interval_s", 30))
+        # When True, the tray also goes grey if HA hasn't posted to /heartbeat
+        # within heartbeat_grace_s. Opt-in; requires an HA automation.
+        self.heartbeat_required: bool = bool(d.get("heartbeat_required", False))
+        # Max age (seconds) of the last /heartbeat before the link is stale.
+        # Default 90s pairs with a 60s HA cadence (one missed beat tolerated).
+        self.heartbeat_grace_s: int = int(d.get("heartbeat_grace_s", 90))
+
+
+# ---------------------------------------------------------------------------
+# Connection-health state (shared between webhook server and tray)
+# ---------------------------------------------------------------------------
+
+class HealthState:
+    """Tracks the last inbound heartbeat from Home Assistant.
+
+    The webhook server stamps this when HA hits /heartbeat; the tray reads it
+    to decide whether the link is still considered alive. Writes/reads of a
+    single float attribute are atomic under the GIL, so no lock is needed.
+    """
+
+    def __init__(self):
+        # Start the clock at init so the tray has a grace window on startup
+        # instead of immediately going grey before the first heartbeat arrives.
+        self.last_heartbeat_ts: float = time.time()
+
+    def stamp_heartbeat(self) -> None:
+        self.last_heartbeat_ts = time.time()
+
+    def seconds_since_heartbeat(self) -> float:
+        return time.time() - self.last_heartbeat_ts
 
 
 # ---------------------------------------------------------------------------
@@ -424,8 +455,9 @@ class SystemTray:
     in a short-lived worker thread and delivers its result via a Qt signal.
     """
 
-    def __init__(self, cfg: Config, on_quit):
+    def __init__(self, cfg: Config, health: HealthState, on_quit):
         self.cfg = cfg
+        self.health = health
         self._on_quit = on_quit
 
     def run(self):
@@ -457,31 +489,60 @@ class SystemTray:
         tray.show()
 
         class _Signals(QObject):
-            result = pyqtSignal(bool)
+            outbound = pyqtSignal(bool)
         sig = _Signals()
 
-        def apply(reachable: bool):
-            if reachable:
+        # Updated by the outbound poll worker, read on the Qt thread by refresh().
+        state = {"outbound_ok": False}
+
+        def refresh():
+            outbound_ok = state["outbound_ok"]
+            if self.cfg.heartbeat_required:
+                age = self.health.seconds_since_heartbeat()
+                hb_fresh = age < self.cfg.heartbeat_grace_s
+                healthy = outbound_ok and hb_fresh
+                if healthy:
+                    label = "reachable"
+                elif outbound_ok and not hb_fresh:
+                    label = f"no heartbeat ({int(age)}s)"
+                elif not outbound_ok and hb_fresh:
+                    label = "outbound unreachable"
+                else:
+                    label = "unreachable"
+            else:
+                healthy = outbound_ok
+                label = "reachable" if healthy else "unreachable"
+
+            if healthy:
                 tray.setIcon(icon_blue)
-                tray.setToolTip(f"hanotifications — Home Assistant reachable ({self.cfg.ha_url})")
-                status.setText("HA: reachable")
             else:
                 tray.setIcon(icon_grey)
-                tray.setToolTip(f"hanotifications — Home Assistant unreachable ({self.cfg.ha_url})")
-                status.setText("HA: unreachable")
+            tray.setToolTip(f"hanotifications — HA {label} ({self.cfg.ha_url})")
+            status.setText(f"HA: {label}")
 
-        sig.result.connect(apply)
+        def on_outbound(ok: bool):
+            state["outbound_ok"] = ok
+            refresh()
+        sig.outbound.connect(on_outbound)
 
         def poll():
             def worker():
                 ok = _check_ha_reachable(self.cfg)
-                sig.result.emit(ok)
+                sig.outbound.emit(ok)
             threading.Thread(target=worker, daemon=True).start()
 
         timer = QTimer()
         timer.timeout.connect(poll)
         timer.start(max(5, self.cfg.ha_check_interval_s) * 1000)
         poll()  # initial check
+
+        # Re-evaluate tray state on a faster cadence when heartbeats matter, so
+        # the icon flips within a few seconds of the grace window expiring
+        # instead of waiting up to a full outbound-check interval.
+        if self.cfg.heartbeat_required:
+            hb_timer = QTimer()
+            hb_timer.timeout.connect(refresh)
+            hb_timer.start(5000)
 
         def do_quit():
             try:
@@ -498,9 +559,10 @@ class SystemTray:
 # ---------------------------------------------------------------------------
 
 class WebhookServer:
-    def __init__(self, config: Config, notifier: Notifier):
+    def __init__(self, config: Config, notifier: Notifier, health: HealthState):
         self.cfg = config
         self.notifier = notifier
+        self.health = health
 
     # -- auth ----------------------------------------------------------------
 
@@ -561,12 +623,21 @@ class WebhookServer:
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.Response(text="hanotifications OK")
 
+    async def handle_heartbeat(self, request: web.Request) -> web.Response:
+        body = await request.read()
+        if not self._authorized(request, body):
+            log.warning("Rejected unauthenticated heartbeat from %s", request.remote)
+            return web.Response(status=403, text="Forbidden")
+        self.health.stamp_heartbeat()
+        return web.Response(text="OK")
+
     # -- app -----------------------------------------------------------------
 
     def build_app(self) -> web.Application:
         app = web.Application(client_max_size=4 * 1024 * 1024)
         app.router.add_post("/notify", self.handle_notify)
         app.router.add_get("/health", self.handle_health)
+        app.router.add_post("/heartbeat", self.handle_heartbeat)
         return app
 
 
@@ -579,8 +650,9 @@ def default_config_path() -> str:
     return os.path.join(xdg, "hanotifications", "config.yaml")
 
 
-async def run_server(cfg: Config, notifier: Notifier, stop: asyncio.Event):
-    server = WebhookServer(cfg, notifier)
+async def run_server(cfg: Config, notifier: Notifier, health: HealthState,
+                     stop: asyncio.Event):
+    server = WebhookServer(cfg, notifier, health)
     app = server.build_app()
 
     runner = web.AppRunner(app)
@@ -605,6 +677,7 @@ def main():
 
     cfg = Config(config_path)
     notifier = Notifier(cfg)
+    health = HealthState()
 
     log.info("hanotifications starting on %s:%s", cfg.host, cfg.port)
     if not HAS_DBUS:
@@ -618,7 +691,7 @@ def main():
 
     if not tray_enabled:
         try:
-            asyncio.run(run_server(cfg, notifier, asyncio.Event()))
+            asyncio.run(run_server(cfg, notifier, health, asyncio.Event()))
         except KeyboardInterrupt:
             pass
         return
@@ -636,7 +709,7 @@ def main():
         stop_event = asyncio.Event()
         ready.set()
         try:
-            loop.run_until_complete(run_server(cfg, notifier, stop_event))
+            loop.run_until_complete(run_server(cfg, notifier, health, stop_event))
         except Exception as exc:
             log.error("Webhook server crashed: %s", exc)
         finally:
@@ -652,7 +725,7 @@ def main():
         t.join(timeout=5)
 
     try:
-        SystemTray(cfg, on_quit).run()
+        SystemTray(cfg, health, on_quit).run()
     except KeyboardInterrupt:
         on_quit()
 

@@ -28,7 +28,7 @@ hanotifications  (aiohttp webhook server, systemd user service)
 - The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then displays a notification
 - **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the primary monitor, showing the image at configurable full width — much larger than a standard notification thumbnail
 - **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
-- **Click to livestream** — clicking a camera-snapshot popup opens the live feed (HLS via HA's `stream` integration, with a MJPEG fallback) in a standalone `mpv` window. See [Click-to-livestream](#click-to-livestream-camera-popups) below.
+- **Click to livestream** — clicking a camera-snapshot popup opens the live feed, either in a standalone `mpv` window (default) or in a browser tab served by the daemon's `/viewer` endpoint (`live_stream_mode: browser`, ~2 s latency via hls.js). See [Click-to-livestream](#click-to-livestream-camera-popups) below.
 - **Optional tray icon** — when `system_tray: true` is set, a Home Assistant icon appears in the KDE/Plasma system tray; blue when HA is reachable, grey with a red diagonal slash when it is not. Supports an inbound heartbeat from HA for detecting one-way outages. See [System tray icon](#system-tray-icon-optional) below.
 
 ---
@@ -45,7 +45,8 @@ hanotifications  (aiohttp webhook server, systemd user service)
 | `python-pyqt6` | optional | KDE/Plasma system tray icon (only used when `system_tray: true`) |
 | `python-dbus` | optional | D-Bus notifications with embedded images (text-only fallback if absent) |
 | `libnotify` | optional | `notify-send` fallback when D-Bus is unavailable |
-| `mpv` | optional | Click-to-livestream player for camera-snapshot popups (`live_stream_on_click`) |
+| `mpv` | recommended | Click-to-livestream player under the default `live_stream_mode: mpv`. Not needed when `live_stream_mode: browser`. |
+| web browser + `xdg-open` | optional | Required only for `live_stream_mode: browser`; loads `hls.js` from `cdn.jsdelivr.net` at viewer-page load time. |
 
 > **Without Pillow + tkinter:** image notifications fall back to a standard KDE Plasma notification with a small embedded thumbnail.
 
@@ -155,14 +156,23 @@ ha_check_interval_s: 30
 heartbeat_required: false
 heartbeat_grace_s: 90
 
-# Click-to-livestream: clicking a camera-snapshot popup launches mpv on the
-# live feed. Tries HLS first (via HA's stream integration over WebSocket for
-# real framerate + audio), falls back to MJPEG from camera_proxy_stream.
-# live_stream_fps pins mpv to HA's MJPEG push rate (~2 fps typical) — only
-# used on the MJPEG fallback path; HLS ignores it.
+# Click-to-livestream: clicking a camera-snapshot popup launches the live
+# feed. Tries HLS first (via HA's stream integration over WebSocket for
+# real framerate + audio), falls back to MJPEG from camera_proxy_stream
+# (mpv mode only). live_stream_fps pins mpv to HA's MJPEG push rate
+# (~2 fps typical) — only used on the MJPEG fallback path; HLS ignores it.
 live_stream_on_click: true
 live_stream_player: "mpv"
 live_stream_fps: 2
+
+# How the live stream is launched on click:
+#   "mpv"     — spawn live_stream_player on the stream directly; HLS via
+#                ffmpeg (no LL-HLS part support → ~10 s live latency), with
+#                MJPEG fallback at live_stream_fps.
+#   "browser" — xdg-open the daemon's /viewer page, which plays HA's HLS
+#                stream via hls.js (LL-HLS part-aware → matches HA's UI
+#                latency, ~2 s). No MJPEG fallback in this mode.
+live_stream_mode: "mpv"
 ```
 
 ---
@@ -291,18 +301,20 @@ More examples are in [`ha_examples/automations.yaml`](ha_examples/automations.ya
 
 ### Click-to-livestream (camera popups)
 
-When a notification includes `camera_entity`, clicking the snapshot popup opens the live feed in a standalone `mpv` window alongside dismissing the popup. Auto-dismiss on timeout does **not** launch the player — only an explicit click. Controlled by `live_stream_on_click` (default `true`); the feature no-ops gracefully if `mpv` is not installed.
+When a notification includes `camera_entity`, clicking the snapshot popup opens the live feed alongside dismissing the popup. Auto-dismiss on timeout does **not** launch the stream — only an explicit click. Controlled by `live_stream_on_click` (default `true`).
 
 Two launch modes, controlled by `live_stream_mode`:
 
-- **`mpv` (default)** — launches `mpv` on the stream directly. Tries HLS first via HA's stream integration (WebSocket `camera/stream` handshake → signed HLS URL), falls back to MJPEG from `/api/camera_proxy_stream/{entity}` if the handshake fails. Drawback: ffmpeg's HLS demuxer (what mpv uses) doesn't speak LL-HLS parts, so live latency floor is HA's segment duration — typically ~10 s. MJPEG fallback is ~2 fps snapshot polling, pinned via `live_stream_fps`.
-- **`browser`** — `xdg-open`s a page served by the daemon at `/viewer` which plays the same HLS via `hls.js` in your default browser. `hls.js` **does** speak `EXT-X-PART`, so latency matches HA's own UI (~2 s). The viewer page lives fully on your loopback (`127.0.0.1:{port}`); the browser tab loads `hls.js` from the jsDelivr CDN. The `/viewer` endpoint is gated by a short-lived (5 min) per-notification token so the `webhook_secret` never ends up in the browser URL, history, or Referer headers. The daemon's access log also masks `token=…` values.
+- **`mpv` (default)** — launches `mpv` on the stream directly. Tries HLS first via HA's stream integration (WebSocket `camera/stream` handshake → signed HLS URL), falls back to MJPEG from `/api/camera_proxy_stream/{entity}` if the handshake fails. Drawback: ffmpeg's HLS demuxer (what mpv uses) doesn't speak LL-HLS parts, so live latency floor is HA's segment duration — typically ~10 s. MJPEG fallback is ~2 fps snapshot polling, pinned via `live_stream_fps`. No-ops gracefully if `mpv` is not installed.
+- **`browser`** — `xdg-open`s a page served by the daemon at `/viewer` which plays the same HLS via `hls.js` in your default browser. `hls.js` **does** speak `EXT-X-PART`, so latency matches HA's own UI (~2 s). The viewer page lives fully on your loopback (`127.0.0.1:{port}`); the browser tab loads `hls.js` from the jsDelivr CDN (outbound internet needed only for that one script). The `/viewer` endpoint is gated by a short-lived (5 min) per-notification token so the `webhook_secret` never ends up in the browser URL, history, or Referer headers; the daemon's access log also masks `token=…` values. There is no MJPEG fallback in browser mode — if HLS init fails the page returns an error.
 
-The window starts muted so a motion alert doesn't suddenly play sound — press `m` or click the mute button in mpv's on-screen controls to unmute.
+In both modes playback starts muted so a motion alert doesn't suddenly play sound. Unmute in mpv mode by pressing `m` or clicking the OSC mute button; in browser mode use the HTML5 video controls.
 
-For the MJPEG fallback path, the bearer token is passed to mpv via a short-lived `0600` include file in `/tmp` so it never appears on the command line. The HLS path uses the signed URL from HA and needs no token at mpv time.
+Security notes:
+- `mpv` mode, MJPEG fallback path: the bearer token is passed to mpv via a short-lived `0600` include file in `/tmp` so it never appears on the command line. The HLS path uses the signed URL from HA and needs no token at mpv time.
+- `browser` mode: the signed HLS URL is embedded in the page source, but the page is served `Cache-Control: no-store` and meta `referrer=no-referrer` so it doesn't persist or leak across origins.
 
-Popup-subprocess warnings (HLS fetch failures, mpv errors, etc.) go to the daemon's journal — tail them with `journalctl --user -u hanotifications -f`.
+Popup-subprocess warnings (HLS fetch failures, mpv errors, `xdg-open` failures, etc.) go to the daemon's journal — tail them with `journalctl --user -u hanotifications -f`.
 
 ---
 

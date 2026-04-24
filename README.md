@@ -28,7 +28,8 @@ hanotifications  (aiohttp webhook server, systemd user service)
 - The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then displays a notification
 - **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the primary monitor, showing the image at configurable full width — much larger than a standard notification thumbnail
 - **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
-- **Optional tray icon** — when `system_tray: true` is set, a Home Assistant icon appears in the KDE/Plasma system tray, blue when the HA server is reachable and grey when it is not. See [System tray icon](#system-tray-icon-optional) below.
+- **Click to livestream** — clicking a camera-snapshot popup opens the live feed (HLS via HA's `stream` integration, with a MJPEG fallback) in a standalone `mpv` window. See [Click-to-livestream](#click-to-livestream-camera-popups) below.
+- **Optional tray icon** — when `system_tray: true` is set, a Home Assistant icon appears in the KDE/Plasma system tray; blue when HA is reachable, grey with a red diagonal slash when it is not. Supports an inbound heartbeat from HA for detecting one-way outages. See [System tray icon](#system-tray-icon-optional) below.
 
 ---
 
@@ -140,12 +141,28 @@ max_image_px: 512
 image_popup_width: 640
 
 # Show a Home Assistant icon in the KDE/Plasma system tray.
-# Blue when the HA server is reachable, grey when it is not.
+# Blue when the HA server is reachable; grey with a red diagonal slash when not.
 # Requires python-pyqt6.
 system_tray: false
 
 # Seconds between HA reachability checks used to color the tray icon.
 ha_check_interval_s: 30
+
+# Inbound heartbeat (opt-in). When true, the tray also goes grey if HA has
+# not POSTed to /heartbeat within heartbeat_grace_s. Pairs with the
+# hanotifications_heartbeat rest_command + time_pattern automation in
+# ha_examples/.
+heartbeat_required: false
+heartbeat_grace_s: 90
+
+# Click-to-livestream: clicking a camera-snapshot popup launches mpv on the
+# live feed. Tries HLS first (via HA's stream integration over WebSocket for
+# real framerate + audio), falls back to MJPEG from camera_proxy_stream.
+# live_stream_fps pins mpv to HA's MJPEG push rate (~2 fps typical) — only
+# used on the MJPEG fallback path; HLS ignores it.
+live_stream_on_click: true
+live_stream_player: "mpv"
+live_stream_fps: 2
 ```
 
 ---
@@ -274,13 +291,18 @@ More examples are in [`ha_examples/automations.yaml`](ha_examples/automations.ya
 
 ### Click-to-livestream (camera popups)
 
-When a notification includes `camera_entity`, clicking the snapshot popup launches `mpv` on the live MJPEG feed (`/api/camera_proxy_stream/{entity}`) in a standalone window. Auto-dismiss on timeout does **not** launch the player — only an explicit click. Controlled by `live_stream_on_click` (default `true`); the feature no-ops gracefully if `mpv` is not installed.
+When a notification includes `camera_entity`, clicking the snapshot popup opens the live feed in a standalone `mpv` window alongside dismissing the popup. Auto-dismiss on timeout does **not** launch the player — only an explicit click. Controlled by `live_stream_on_click` (default `true`); the feature no-ops gracefully if `mpv` is not installed.
 
-MJPEG is video-only (no audio in the protocol). The window starts muted so mpv's OSC mute button is visible for consistency; pressing `m` is a no-op on a no-audio stream.
+The popup tries two stream sources, in order:
 
-MJPEG carries no framerate metadata, so `live_stream_fps` (default `2`) tells mpv how fast HA is actually pushing frames. HA's `camera_proxy_stream` is ~2 fps for most cameras; raise this if your camera streams faster, lower it if playback still runs ahead of real time.
+1. **HLS via HA's stream integration** (preferred). On click, the popup does a short WebSocket handshake against `/api/websocket`, authenticates with your `ha_token`, and calls `camera/stream` with `format: hls` — HA returns a short-lived signed URL like `/api/hls/<token>/master_playlist.m3u8` that mpv plays directly. This gives the camera's real native framerate and audio when the camera provides it. Requires HA's `stream` integration (enabled by default via `default_config:`) and a camera that supports HLS output.
+2. **MJPEG from `/api/camera_proxy_stream/{entity}`** (fallback). Used when the WS handshake fails or the camera can't produce HLS. HA's MJPEG endpoint is snapshot polling, typically **~2 fps regardless of your camera's native rate**. `live_stream_fps` (default `2`) pins mpv to that rate so it doesn't fast-forward through a no-PTS stream.
 
-The token is passed to mpv via a short-lived `0600` include file in `/tmp` so it never appears on the command line.
+The window starts muted so a motion alert doesn't suddenly play sound — press `m` or click the mute button in mpv's on-screen controls to unmute.
+
+For the MJPEG fallback path, the bearer token is passed to mpv via a short-lived `0600` include file in `/tmp` so it never appears on the command line. The HLS path uses the signed URL from HA and needs no token at mpv time.
+
+Popup-subprocess warnings (HLS fetch failures, mpv errors, etc.) go to the daemon's journal — tail them with `journalctl --user -u hanotifications -f`.
 
 ---
 
@@ -312,7 +334,7 @@ curl http://127.0.0.1:8765/health
 hanotifications can show a Home Assistant icon in the KDE/Plasma system tray that reflects HA reachability at a glance:
 
 - **Blue** house icon — the HA server responded to `GET {ha_url}/api/` within the poll interval
-- **Grey** house icon — the server did not respond (wrong URL, HA down, network issue, bad token, etc.)
+- **Grey** house icon with a **red diagonal slash** — the server did not respond (wrong URL, HA down, network issue, bad token, etc.), or — when the inbound heartbeat is enabled — no heartbeat from HA has arrived within the grace window
 
 Right-clicking the icon shows the current reachability state and a **Quit** item that stops the webhook server.
 

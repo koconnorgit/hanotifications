@@ -13,6 +13,7 @@ echo "==> Installing Python dependencies (pacman) ..."
 # tk:                          tkinter for the custom large-image popup.
 # python-pyqt6:                KDE/Plasma system tray icon (optional).
 # libnotify:                   notify-send fallback when D-Bus is unavailable.
+# mpv:                         click-to-livestream player for camera popups.
 sudo pacman -S --needed --noconfirm \
     python \
     python-aiohttp \
@@ -21,7 +22,8 @@ sudo pacman -S --needed --noconfirm \
     python-pillow \
     tk \
     python-pyqt6 \
-    libnotify
+    libnotify \
+    mpv
 
 echo "==> Copying service files to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"

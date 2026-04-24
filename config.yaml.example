@@ -55,6 +55,24 @@ max_image_px: 512
 # Set to 0 to disable the custom popup and always use the standard notification.
 image_popup_width: 640
 
+# When true, clicking a camera-snapshot popup ALSO opens the live MJPEG feed
+# in an external player window (in addition to dismissing the popup).
+# Auto-dismiss on timeout does not launch the player — only an explicit click.
+# Only fires for notifications that include camera_entity.
+live_stream_on_click: true
+
+# External player used for the live feed. Must be on PATH. Currently hard-wired
+# to mpv's CLI flags (--profile=low-latency, --include, etc.), so changing this
+# only makes sense if the replacement accepts the same flags.
+live_stream_player: "mpv"
+
+# Frames-per-second hint for the MJPEG stream. MJPEG has no framerate metadata,
+# so mpv defaults to 25 fps — which makes low-fps HA cameras play in
+# fast-forward bursts. HA's camera_proxy_stream is typically ~2 fps. Raise for
+# faster cameras (e.g. Frigate, some MJPEG IP cams); if playback still runs
+# ahead of real time, lower this.
+live_stream_fps: 2
+
 # -------------------------------------------------------------------
 # System tray icon (KDE / Plasma)
 # -------------------------------------------------------------------

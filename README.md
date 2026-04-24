@@ -44,6 +44,7 @@ hanotifications  (aiohttp webhook server, systemd user service)
 | `python-pyqt6` | optional | KDE/Plasma system tray icon (only used when `system_tray: true`) |
 | `python-dbus` | optional | D-Bus notifications with embedded images (text-only fallback if absent) |
 | `libnotify` | optional | `notify-send` fallback when D-Bus is unavailable |
+| `mpv` | optional | Click-to-livestream player for camera-snapshot popups (`live_stream_on_click`) |
 
 > **Without Pillow + tkinter:** image notifications fall back to a standard KDE Plasma notification with a small embedded thumbnail.
 
@@ -270,6 +271,16 @@ More examples are in [`ha_examples/automations.yaml`](ha_examples/automations.ya
 | `timeout_ms` | integer | Display duration in milliseconds. `0` = never dismiss. Defaults to `default_timeout_ms` |
 
 `camera_entity` and `image_url` are mutually exclusive; `image_url` takes precedence if both are set.
+
+### Click-to-livestream (camera popups)
+
+When a notification includes `camera_entity`, clicking the snapshot popup launches `mpv` on the live MJPEG feed (`/api/camera_proxy_stream/{entity}`) in a standalone window. Auto-dismiss on timeout does **not** launch the player — only an explicit click. Controlled by `live_stream_on_click` (default `true`); the feature no-ops gracefully if `mpv` is not installed.
+
+MJPEG is video-only (no audio in the protocol). The window starts muted so mpv's OSC mute button is visible for consistency; pressing `m` is a no-op on a no-audio stream.
+
+MJPEG carries no framerate metadata, so `live_stream_fps` (default `2`) tells mpv how fast HA is actually pushing frames. HA's `camera_proxy_stream` is ~2 fps for most cameras; raise this if your camera streams faster, lower it if playback still runs ahead of real time.
+
+The token is passed to mpv via a short-lived `0600` include file in `/tmp` so it never appears on the command line.
 
 ---
 

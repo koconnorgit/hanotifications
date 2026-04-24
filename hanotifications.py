@@ -56,7 +56,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _POPUP_SCRIPT = r"""
-import sys, os, json
+import sys, os, json, shutil, subprocess, tempfile, threading, asyncio
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 try:
     import tkinter as tk
     from PIL import Image, ImageTk
@@ -64,12 +69,121 @@ except ImportError as exc:
     print(f"popup: missing dependency: {exc}", file=sys.stderr)
     sys.exit(1)
 
-data     = json.loads(sys.argv[1])
-title    = data['title']
-body     = data['body']
-path     = data['path']
-width    = data['width']
-timeout  = data['timeout_ms']
+data              = json.loads(sys.argv[1])
+title             = data['title']
+body              = data['body']
+path              = data['path']
+width             = data['width']
+timeout           = data['timeout_ms']
+live_stream_url   = data.get('live_stream_url')
+live_stream_player = data.get('live_stream_player', 'mpv')
+live_stream_fps   = data.get('live_stream_fps', 2)
+ha_url            = data.get('ha_url', '')
+ha_token          = data.get('ha_token', '')
+ssl_verify        = data.get('ha_ssl_verify', True)
+camera_entity     = data.get('camera_entity', '')
+
+
+def fetch_hls_url():
+    '''HA WS handshake -> signed HLS path. Returns None on any failure.
+
+    HA's /api/hls/<entity>/master_playlist.m3u8 is NOT a real URL; the stream
+    integration requires a WS request (camera/stream) that returns a signed,
+    session-bound URL like /api/hls/<32-char-token>/master_playlist.m3u8.
+    '''
+    if not (HAS_AIOHTTP and ha_url and ha_token and camera_entity):
+        return None
+    # http(s)://host -> ws(s)://host
+    ws_url = ha_url.rstrip('/').replace('http', 'ws', 1) + '/api/websocket'
+
+    async def go():
+        timeout = aiohttp.ClientTimeout(total=5)
+        ssl_arg = None if ssl_verify else False
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.ws_connect(ws_url, ssl=ssl_arg) as ws:
+                hello = await ws.receive_json()
+                if hello.get('type') != 'auth_required':
+                    return None
+                await ws.send_json({'type': 'auth', 'access_token': ha_token})
+                resp = await ws.receive_json()
+                if resp.get('type') != 'auth_ok':
+                    return None
+                await ws.send_json({
+                    'id': 1, 'type': 'camera/stream',
+                    'entity_id': camera_entity, 'format': 'hls',
+                })
+                resp = await ws.receive_json()
+                if not resp.get('success'):
+                    print(f"popup: camera/stream failed: {resp}", file=sys.stderr)
+                    return None
+                return resp.get('result', {}).get('url')
+
+    try:
+        return asyncio.run(go())
+    except Exception as exc:
+        print(f"popup: HLS fetch failed: {exc}", file=sys.stderr)
+        return None
+
+
+def launch_live_stream():
+    if not live_stream_url:
+        return
+    player = shutil.which(live_stream_player) if live_stream_player else None
+    if not player:
+        print(f"popup: player {live_stream_player!r} not on PATH — skipping live stream",
+              file=sys.stderr)
+        return
+
+    # Prefer HLS (true video, real framerate, audio when the camera provides
+    # it). Fall back to MJPEG polling if the WS handshake fails for any reason.
+    use_hls = False
+    stream_url = live_stream_url
+    hls_path = fetch_hls_url()
+    if hls_path:
+        stream_url = ha_url.rstrip('/') + hls_path
+        use_hls = True
+
+    # mpv conf file holds secrets we don't want on argv (and TLS-skip for
+    # self-signed). For HLS the URL is signed so no auth header is needed;
+    # for MJPEG we must send the bearer token.
+    conf_path = None
+    want_auth = (not use_hls) and bool(ha_token)
+    want_no_tls = not ssl_verify
+    if want_auth or want_no_tls:
+        fd, conf_path = tempfile.mkstemp(prefix='hanofy_mpv_', suffix='.conf', dir='/tmp')
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w') as fh:
+            if want_auth:
+                fh.write(f'http-header-fields="Authorization: Bearer {ha_token}"\n')
+            if want_no_tls:
+                fh.write('tls-verify=no\n')
+
+    args = [player, '--mute=yes', '--force-window=yes', f'--title={title}']
+    if not use_hls:
+        # MJPEG has no PTS or framerate metadata; pin playback to HA's
+        # snapshot rate so mpv doesn't fast-forward through a buffer.
+        args.extend(['--no-correct-pts',
+                     f'--container-fps-override={live_stream_fps}'])
+    if conf_path:
+        args.append(f'--include={conf_path}')
+    args.append(stream_url)
+
+    try:
+        subprocess.Popen(args, start_new_session=True,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception as exc:
+        print(f"popup: player launch failed: {exc}", file=sys.stderr)
+        if conf_path:
+            try: os.unlink(conf_path)
+            except OSError: pass
+        return
+
+    if conf_path:
+        def _cleanup():
+            try: os.unlink(conf_path)
+            except OSError: pass
+        threading.Timer(2.0, _cleanup).start()
 
 def primary_screen_geom(tk_root):
     # Returns (x, y, w, h) of the primary monitor. Prefers xrandr so we get
@@ -130,7 +244,11 @@ x = px + pw - w - 20
 y = py + ph - h - 60
 root.geometry(f'{w}x{h}+{x}+{y}')
 
-root.bind('<Button-1>', lambda e: root.destroy())
+def on_click(_e):
+    launch_live_stream()
+    root.destroy()
+
+root.bind('<Button-1>', on_click)
 root.after(timeout, root.destroy)
 
 try:
@@ -182,6 +300,18 @@ class Config:
         # Max age (seconds) of the last /heartbeat before the link is stale.
         # Default 90s pairs with a 60s HA cadence (one missed beat tolerated).
         self.heartbeat_grace_s: int = int(d.get("heartbeat_grace_s", 90))
+        # When True, clicking a camera-snapshot popup also spawns an external
+        # player on the live MJPEG feed (in addition to dismissing the popup).
+        self.live_stream_on_click: bool = bool(d.get("live_stream_on_click", True))
+        # External player used for the live feed. Must accept a URL as the
+        # last positional arg and understand --http-header-fields via a conf
+        # file (currently hard-wired to mpv's CLI surface).
+        self.live_stream_player: str = d.get("live_stream_player", "mpv")
+        # Frames-per-second hint for the MJPEG stream. MJPEG has no framerate
+        # metadata so mpv defaults to 25fps, which makes low-fps HA cameras
+        # play in fast-forward bursts. HA's camera_proxy_stream is typically
+        # ~2fps. Raise for faster cameras, lower if playback still runs ahead.
+        self.live_stream_fps: float = float(d.get("live_stream_fps", 2))
 
 
 # ---------------------------------------------------------------------------
@@ -311,27 +441,43 @@ class Notifier:
     # -- custom image popup --------------------------------------------------
 
     def _show_image_popup(self, title: str, body: str, image_path: str,
-                          timeout_ms: int) -> bool:
+                          timeout_ms: int,
+                          live_stream_url: str | None = None,
+                          camera_entity: str | None = None) -> bool:
         """Launch a large custom popup window for the image in a subprocess.
 
         The subprocess takes ownership of *image_path* and unlinks it when done.
+        If *live_stream_url* is given, clicking the popup also spawns the
+        configured live-stream player on that URL; *camera_entity* lets the
+        popup request a signed HLS URL from HA instead of the MJPEG fallback.
         Returns True if the subprocess was launched successfully.
         """
         import subprocess
         import json
 
-        data = json.dumps({
+        payload = {
             "title": title,
             "body": body,
             "path": image_path,
             "width": self.cfg.image_popup_width,
             "timeout_ms": timeout_ms,
-        })
+        }
+        if live_stream_url and self.cfg.live_stream_on_click:
+            payload["live_stream_url"] = live_stream_url
+            payload["live_stream_player"] = self.cfg.live_stream_player
+            payload["live_stream_fps"] = self.cfg.live_stream_fps
+            payload["ha_url"] = self.cfg.ha_url
+            payload["ha_token"] = self.cfg.ha_token
+            payload["ha_ssl_verify"] = self.cfg.ha_ssl_verify
+            if camera_entity:
+                payload["camera_entity"] = camera_entity
+        data = json.dumps(payload)
         try:
+            # Inherit stderr so popup-subprocess warnings (HLS fetch failures,
+            # mpv-not-found, etc.) land in the daemon's journal for debugging.
             subprocess.Popen(
                 [sys.executable, "-c", _POPUP_SCRIPT, data],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
             return True
@@ -359,7 +505,9 @@ class Notifier:
     async def send(self, title: str, body: str,
                    image_url: str | None = None,
                    urgency: str | None = None,
-                   timeout_ms: int | None = None):
+                   timeout_ms: int | None = None,
+                   live_stream_url: str | None = None,
+                   camera_entity: str | None = None):
         urgency = urgency or self.cfg.default_urgency
         timeout_ms = timeout_ms if timeout_ms is not None else self.cfg.default_timeout_ms
 
@@ -371,7 +519,8 @@ class Notifier:
         # instead of the standard notification so the image appears at full size.
         if (image_path and self.cfg.image_popup_width > 0
                 and HAS_TKINTER and HAS_PILLOW):
-            if self._show_image_popup(title, body, image_path, timeout_ms):
+            if self._show_image_popup(title, body, image_path, timeout_ms,
+                                      live_stream_url, camera_entity):
                 # Subprocess owns image_path cleanup; nothing left to do here.
                 return
 
@@ -623,14 +772,24 @@ class WebhookServer:
 
         # Convenience: pass camera_entity instead of full image_url
         camera_entity: str | None = data.get("camera_entity")
-        if camera_entity and not image_url:
-            image_url = f"{self.cfg.ha_url}/api/camera_proxy/{camera_entity}"
+        live_stream_url: str | None = None
+        if camera_entity:
+            if not image_url:
+                image_url = f"{self.cfg.ha_url}/api/camera_proxy/{camera_entity}"
+            # MJPEG stream via camera_proxy_stream. Works for any HA camera
+            # that can produce a snapshot. Video-only (MJPEG has no audio
+            # track). HLS would carry audio but requires initializing a
+            # signed stream session via HA's WebSocket API, which is a
+            # bigger change than was in scope here.
+            live_stream_url = f"{self.cfg.ha_url}/api/camera_proxy_stream/{camera_entity}"
 
-        log.info("Notification: %r  image=%s", title, bool(image_url))
+        log.info("Notification: %r  image=%s  live=%s",
+                 title, bool(image_url), bool(live_stream_url))
 
         # Fire and forget — respond immediately so HA doesn't time out
         asyncio.create_task(
-            self.notifier.send(title, message, image_url, urgency, timeout_ms)
+            self.notifier.send(title, message, image_url, urgency, timeout_ms,
+                               live_stream_url, camera_entity)
         )
         return web.Response(text="OK")
 

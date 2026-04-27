@@ -186,7 +186,10 @@ Add the following to your `configuration.yaml` (or a file included from it):
 ```yaml
 rest_command:
   desktop_notify:
-    url: "http://127.0.0.1:8765/notify"
+    # Workstation IP comes from sensor.hanotifications_host, which the agent
+    # self-registers on every reachability check (~30s). Survives DNS hiccups
+    # and DHCP renewals. Falls back to port 8765 if the attribute is missing.
+    url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765) }}/notify"
     method: POST
     headers:
       Authorization: "Bearer change-me-to-a-random-string"
@@ -204,7 +207,9 @@ rest_command:
 
 Use the same value for `webhook_secret` in both `config.yaml` and the `Authorization` header above.
 
-Reload HA after adding the REST command (`Developer Tools → Restart` or `ha core reload`).
+Reload HA after adding the REST command (`Developer Tools → YAML → REST Commands`, or restart HA).
+
+> The `sensor.hanotifications_host` entity is created automatically by the agent on its first successful reachability check against HA — no manual setup needed. If HA is on the same machine as the workstation, you can substitute `127.0.0.1:8765` directly. See [Host self-registration](#host-self-registration) for details.
 
 ### 2. Use in automations
 

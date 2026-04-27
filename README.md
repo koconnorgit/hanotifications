@@ -371,6 +371,18 @@ The tray icon requires `python-pyqt6`, which `install.sh` installs by default on
 
 The reachability check calls `GET {ha_url}/api/` with your `ha_token` and a 5-second timeout. It is cheap and safe to run frequently; 30 seconds is a reasonable default.
 
+### Host self-registration
+
+On every successful reachability check, the agent also writes its current source IP — the address the OS would use to reach `ha_url`, determined via a connected UDP socket — to the HA entity `sensor.hanotifications_host`, with the listener port stored as an attribute. The example `rest_command` definitions in `ha_examples/rest_command.yaml` template their URLs from that sensor:
+
+```yaml
+url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765) }}/notify"
+```
+
+This makes HA → workstation calls resilient to DNS failures and DHCP renewals: HA always targets whatever IP the workstation last reported, refreshed at the `ha_check_interval_s` cadence. The sensor only appears after the first successful agent → HA check, so on a cold HA restart the first ≤30 s window is best-effort. Self-registration requires `ha_token`; it silently no-ops if the token is unset.
+
+The tray tooltip displays the last registered IP (`hanotifications — HA reachable (...) — reporting 192.168.1.42`) so you can confirm at a glance which address HA is being told to call.
+
 ### Inbound heartbeat (optional)
 
 The outbound check above catches failures where this machine can't reach HA. To also catch the other direction — HA is up but can no longer reach this host (firewall change, network move, broken automation) — enable the inbound heartbeat.

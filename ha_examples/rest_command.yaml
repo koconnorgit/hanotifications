@@ -3,9 +3,15 @@
 # This defines a reusable REST command that calls the hanotifications webhook.
 # Replace the URL and secret to match your config.yaml.
 
+# The workstation IP is sourced from sensor.hanotifications_host, which the
+# agent self-registers on every reachability check (~30s cadence). This makes
+# the rest_command resilient to DNS failures and DHCP renewals — HA always
+# hits whatever IP the workstation last reported. If the sensor is missing
+# (agent never ran, HA restarted before first check), templating yields an
+# empty host and the call will fail until the agent re-registers.
 rest_command:
   desktop_notify:
-    url: "http://127.0.0.1:8765/notify"   # adjust host if HA is on another machine
+    url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765) }}/notify"
     method: POST
     headers:
       Authorization: "Bearer change-me-to-a-random-string"
@@ -23,7 +29,7 @@ rest_command:
   # Used by the heartbeat automation below to prove to hanotifications that
   # HA can still reach it. If this stops firing, the tray icon goes grey.
   hanotifications_heartbeat:
-    url: "http://127.0.0.1:8765/heartbeat"
+    url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765) }}/heartbeat"
     method: POST
     headers:
       Authorization: "Bearer change-me-to-a-random-string"

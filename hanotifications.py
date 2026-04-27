@@ -743,13 +743,46 @@ def _render_ha_icon(color: str, size: int = 64, disconnected: bool = False) -> "
     return QIcon(pm)
 
 
-def _check_ha_reachable(cfg: Config) -> bool:
-    """Synchronous reachability check used by the tray poller."""
+_HOST_SENSOR_ENTITY = "sensor.hanotifications_host"
+
+
+def _local_ip_to(host: str, port: int) -> str | None:
+    """Return the source IP the OS would use to reach host:port.
+
+    Uses a connected UDP socket — no packets are sent, but the kernel
+    still picks an outgoing interface and assigns a source address. This
+    is correct on multi-NIC / VPN hosts where gethostbyname(gethostname())
+    would return the wrong interface.
+    """
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2)
+            s.connect((host, port))
+            return s.getsockname()[0]
+    except Exception:
+        return None
+
+
+def _check_ha_reachable(cfg: Config) -> tuple[bool, str | None]:
+    """Synchronous reachability check used by the tray poller.
+
+    Returns (ok, registered_ip). registered_ip is the source IP that was
+    successfully POSTed to sensor.hanotifications_host on this call, or
+    None if the check failed or the registration step didn't run.
+
+    Piggybacks an IP-registration POST onto each successful check: writes
+    this workstation's source IP to sensor.hanotifications_host on HA, so
+    HA's rest_commands can target {{ states('sensor.hanotifications_host') }}
+    instead of a hostname that may fail to resolve.
+    """
     import ssl
+    import urllib.parse
     import urllib.request
 
     if not cfg.ha_url:
-        return False
+        return False, None
 
     ctx = None
     if cfg.ha_url.startswith("https") and not cfg.ha_ssl_verify:
@@ -762,9 +795,40 @@ def _check_ha_reachable(cfg: Config) -> bool:
         req.add_header("Authorization", f"Bearer {cfg.ha_token}")
     try:
         with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
-            return 200 <= resp.status < 300
+            ok = 200 <= resp.status < 300
     except Exception:
-        return False
+        return False, None
+
+    registered_ip: str | None = None
+    if ok and cfg.ha_token:
+        parsed = urllib.parse.urlparse(cfg.ha_url)
+        default_port = 443 if parsed.scheme == "https" else 80
+        ha_host = parsed.hostname or ""
+        ha_port = parsed.port or default_port
+        ip = _local_ip_to(ha_host, ha_port) if ha_host else None
+        if ip:
+            payload = json.dumps({
+                "state": ip,
+                "attributes": {
+                    "port": cfg.port,
+                    "friendly_name": "hanotifications host",
+                    "source": "hanotifications agent",
+                },
+            }).encode()
+            reg = urllib.request.Request(
+                f"{cfg.ha_url}/api/states/{_HOST_SENSOR_ENTITY}",
+                data=payload, method="POST",
+            )
+            reg.add_header("Authorization", f"Bearer {cfg.ha_token}")
+            reg.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(reg, timeout=5, context=ctx) as r:
+                    if 200 <= r.status < 300:
+                        registered_ip = ip
+            except Exception as exc:
+                log.debug("Host IP registration failed: %s", exc)
+
+    return ok, registered_ip
 
 
 class SystemTray:
@@ -808,11 +872,15 @@ class SystemTray:
         tray.show()
 
         class _Signals(QObject):
-            outbound = pyqtSignal(bool)
+            # (ok, registered_ip) — registered_ip is "" when none was reported
+            # this cycle; pyqtSignal can't carry Optional[str] cleanly.
+            outbound = pyqtSignal(bool, str)
         sig = _Signals()
 
         # Updated by the outbound poll worker, read on the Qt thread by refresh().
-        state = {"outbound_ok": False}
+        # registered_ip persists across cycles so a transient registration miss
+        # doesn't blank the tooltip.
+        state = {"outbound_ok": False, "registered_ip": ""}
 
         def refresh():
             outbound_ok = state["outbound_ok"]
@@ -836,18 +904,21 @@ class SystemTray:
                 tray.setIcon(icon_blue)
             else:
                 tray.setIcon(icon_grey)
-            tray.setToolTip(f"hanotifications — HA {label} ({self.cfg.ha_url})")
+            ip_suffix = f" — reporting {state['registered_ip']}" if state["registered_ip"] else ""
+            tray.setToolTip(f"hanotifications — HA {label} ({self.cfg.ha_url}){ip_suffix}")
             status.setText(f"HA: {label}")
 
-        def on_outbound(ok: bool):
+        def on_outbound(ok: bool, ip: str):
             state["outbound_ok"] = ok
+            if ip:
+                state["registered_ip"] = ip
             refresh()
         sig.outbound.connect(on_outbound)
 
         def poll():
             def worker():
-                ok = _check_ha_reachable(self.cfg)
-                sig.outbound.emit(ok)
+                ok, ip = _check_ha_reachable(self.cfg)
+                sig.outbound.emit(ok, ip or "")
             threading.Thread(target=worker, daemon=True).start()
 
         timer = QTimer()

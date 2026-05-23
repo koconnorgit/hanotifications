@@ -189,7 +189,7 @@ rest_command:
     # Workstation IP comes from sensor.hanotifications_host, which the agent
     # self-registers on every reachability check (~30s). Survives DNS hiccups
     # and DHCP renewals. Falls back to port 8765 if the attribute is missing.
-    url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765) }}/notify"
+    url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765, true) }}/notify"
     method: POST
     headers:
       Authorization: "Bearer change-me-to-a-random-string"
@@ -381,7 +381,7 @@ The reachability check calls `GET {ha_url}/api/` with your `ha_token` and a 5-se
 On every successful reachability check, the agent also writes its current source IP — the address the OS would use to reach `ha_url`, determined via a connected UDP socket — to the HA entity `sensor.hanotifications_host`, with the listener port stored as an attribute. The example `rest_command` definitions in `ha_examples/rest_command.yaml` template their URLs from that sensor:
 
 ```yaml
-url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765) }}/notify"
+url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765, true) }}/notify"
 ```
 
 This makes HA → workstation calls resilient to DNS failures and DHCP renewals: HA always targets whatever IP the workstation last reported, refreshed at the `ha_check_interval_s` cadence. The sensor only appears after the first successful agent → HA check, so on a cold HA restart the first ≤30 s window is best-effort. Self-registration requires `ha_token`; it silently no-ops if the token is unset.

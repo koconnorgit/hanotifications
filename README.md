@@ -29,6 +29,7 @@ hanotifications  (aiohttp webhook server, systemd user service)
 - **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the primary monitor, showing the image at configurable full width — much larger than a standard notification thumbnail
 - **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
 - **Click to livestream** — clicking a camera-snapshot popup opens the live feed, either in a standalone `mpv` window (default) or in a browser tab served by the daemon's `/viewer` endpoint (`live_stream_mode: browser`, ~2 s latency via hls.js). See [Click-to-livestream](#click-to-livestream-camera-popups) below.
+- **Live sensor popup** — payloads with a `sensors` list open a persistent monitor window showing current values polled from the HA API (e.g. battery draw + runtime during a power outage), auto-closing when a watched entity recovers. See [Live sensor popup](#live-sensor-popup) below.
 - **Optional tray icon** — when `system_tray: true` is set, a Home Assistant icon appears in the KDE/Plasma system tray; blue when HA is reachable, grey with a red diagonal slash when it is not. Supports an inbound heartbeat from HA for detecting one-way outages. See [System tray icon](#system-tray-icon-optional) below.
 
 ---
@@ -304,6 +305,65 @@ More examples are in [`ha_examples/automations.yaml`](ha_examples/automations.ya
 
 `camera_entity` and `image_url` are mutually exclusive; `image_url` takes precedence if both are set.
 
+### Live sensor popup
+
+Including a `sensors` list in the payload switches from a one-shot notification to a **persistent monitor window**: a normal always-on-top window (draggable by its title bar, closable via the close button) that opens in the bottom-right corner showing the current value of each listed entity in large type, refreshed by polling the HA REST API. Built for "keep an eye on this" situations — e.g. a power outage, where you want battery draw and estimated runtime on screen for the duration.
+
+| Field | Type | Description |
+|---|---|---|
+| `sensors` | list of strings | Entity IDs to display. Presence of this field selects the sensor popup |
+| `refresh_s` | integer | Seconds between HA polls. Defaults to `sensor_popup_refresh_s` (5) |
+| `timeout_ms` | integer | Defaults to `0` for this popup type — stays open until dismissed |
+| `close_entity` | string | Optional entity to watch; the popup closes itself when it reaches one of `close_states` |
+| `close_states` | list of strings | States of `close_entity` that auto-close the popup (compared case-insensitively) |
+| `popup_id` | string | Dedupe key (defaults to `title`). While a popup with the same ID is open, repeat webhooks are ignored instead of stacking windows |
+
+Behavior details:
+
+- Values render as `<state> <unit>`, with duration sensors (unit `min` or `h`) formatted as `11h 10m` and float noise trimmed on other numeric states
+- Drag it anywhere; refreshes keep it where you put it. Close it any time with the window's close button
+- If HA becomes unreachable mid-outage, the last values stay on screen dimmed, with a "Home Assistant unreachable" footer, and polling keeps retrying
+- Requires `tkinter`; without it (or with `sensor_popup_width: 0`) the payload degrades to a standard text notification
+
+There are two ways to trigger a sensor popup:
+
+**1. Daemon-side watch (recommended — no HA config changes).** The daemon subscribes to HA's websocket API and opens the popup itself when a watched entity enters one of its `open_states`. It also fires on daemon startup if the entity is already in an open state (restart mid-outage), and reconnects automatically if the websocket drops. Configure in `config.yaml`:
+
+```yaml
+sensor_popups:
+  - watch_entity: sensor.ef_shp30295_grid_connection_status
+    open_states: ["grid_offline"]
+    close_states: ["grid_in", "feed_grid"]
+    title: "⚡ Power Outage — On Battery"
+    message: "House is running on battery backup."
+    sensors:
+      - sensor.ef_shp30295_system_load
+      - sensor.ef_shp30295_discharge_time_remaining
+    refresh_s: 5
+```
+
+**2. HA-side webhook.** An HA automation POSTs the payload to `/notify` via a rest_command — useful when the trigger logic is more complex than a state match. Note that `rest_command` definitions can only live in HA's `configuration.yaml` (there is no HA API for creating them), so this path requires editing YAML on the HA host. Example — power outage monitor that opens when the house switches to battery and closes itself when grid power returns:
+
+```yaml
+- alias: "Notify desktop: power outage battery monitor"
+  trigger:
+    - platform: state
+      entity_id: sensor.ef_shp30295_grid_connection_status
+      to: "grid_offline"
+  action:
+    - service: rest_command.desktop_sensor_popup
+      data:
+        title: "⚡ Power Outage — On Battery"
+        message: "House is running on battery backup."
+        sensors:
+          - sensor.ef_shp30295_system_load
+          - sensor.ef_shp30295_discharge_time_remaining
+        close_entity: sensor.ef_shp30295_grid_connection_status
+        close_states: ["grid_in", "feed_grid"]
+```
+
+The `desktop_sensor_popup` rest_command is in [`ha_examples/rest_command.yaml`](ha_examples/rest_command.yaml).
+
 ### Click-to-livestream (camera popups)
 
 When a notification includes `camera_entity`, clicking the snapshot popup opens the live feed alongside dismissing the popup. Auto-dismiss on timeout does **not** launch the stream — only an explicit click. Controlled by `live_stream_on_click` (default `true`).
@@ -339,6 +399,12 @@ curl -X POST http://127.0.0.1:8765/notify \
   -H 'Authorization: Bearer YOUR_WEBHOOK_SECRET' \
   -H 'Content-Type: application/json' \
   -d '{"title":"Camera Test","message":"Snapshot attached.","camera_entity":"camera.front_door"}'
+
+# Live sensor popup (persistent window; click it to dismiss)
+curl -X POST http://127.0.0.1:8765/notify \
+  -H 'Authorization: Bearer YOUR_WEBHOOK_SECRET' \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"⚡ On Battery","sensors":["sensor.ef_shp30295_system_load","sensor.ef_shp30295_discharge_time_remaining"]}'
 
 # Health check (no auth required)
 curl http://127.0.0.1:8765/health

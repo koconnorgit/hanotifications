@@ -55,6 +55,33 @@ max_image_px: 512
 # Set to 0 to disable the custom popup and always use the standard notification.
 image_popup_width: 640
 
+# Width in pixels of the live sensor popup window (payloads with a "sensors"
+# list open a persistent window showing current values, polled from the HA
+# API). Set to 0 to disable; such payloads then degrade to a standard
+# text notification.
+sensor_popup_width: 420
+
+# Default seconds between HA polls while a sensor popup is open. Individual
+# payloads can override with "refresh_s".
+sensor_popup_refresh_s: 5
+
+# Daemon-side popup triggers (optional). The daemon subscribes to HA's
+# websocket API and opens a live sensor popup when watch_entity enters one of
+# open_states — no HA rest_command or automation required. The popup closes
+# itself when watch_entity reaches one of close_states (or set close_entity
+# to watch a different one). Also fires on daemon startup if watch_entity is
+# already in open_states (e.g. restart mid-outage).
+#sensor_popups:
+#  - watch_entity: sensor.ef_shp30295_grid_connection_status
+#    open_states: ["grid_offline"]
+#    close_states: ["grid_in", "feed_grid"]
+#    title: "⚡ Power Outage — On Battery"
+#    message: "House is running on battery backup."
+#    sensors:
+#      - sensor.ef_shp30295_system_load
+#      - sensor.ef_shp30295_discharge_time_remaining
+#    refresh_s: 5
+
 # When true, clicking a camera-snapshot popup ALSO opens the live MJPEG feed
 # in an external player window (in addition to dismissing the popup).
 # Auto-dismiss on timeout does not launch the player — only an explicit click.

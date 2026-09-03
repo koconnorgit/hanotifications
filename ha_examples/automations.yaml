@@ -70,7 +70,34 @@
         timeout_ms: 0   # 0 = do not auto-dismiss
 
 # ---------------------------------------------------------------------------
-# 5. Heartbeat — fires every 60s so hanotifications knows HA can reach it.
+# 5. Power outage — live battery monitor window.
+#    When the house switches to battery backup, opens a persistent popup
+#    showing current battery draw and estimated runtime, refreshed every 5s.
+#    The popup closes itself when grid power returns (close_entity reaches
+#    one of close_states); its window close button dismisses it early.
+#
+#    EcoFlow SHP grid status is an enum: grid_in (drawing from grid),
+#    feed_grid (exporting), grid_offline (on battery), unknown, not_valid.
+# ---------------------------------------------------------------------------
+- alias: "Notify desktop: power outage battery monitor"
+  trigger:
+    - platform: state
+      entity_id: sensor.ef_shp30295_grid_connection_status
+      to: "grid_offline"
+  action:
+    - service: rest_command.desktop_sensor_popup
+      data:
+        title: "⚡ Power Outage — On Battery"
+        message: "House is running on battery backup."
+        sensors:
+          - sensor.ef_shp30295_system_load
+          - sensor.ef_shp30295_discharge_time_remaining
+        refresh_s: 5
+        close_entity: sensor.ef_shp30295_grid_connection_status
+        close_states: ["grid_in", "feed_grid"]
+
+# ---------------------------------------------------------------------------
+# 6. Heartbeat — fires every 60s so hanotifications knows HA can reach it.
 #     Pair with heartbeat_required: true in config.yaml (grace window 90s).
 # ---------------------------------------------------------------------------
 - alias: "hanotifications heartbeat"

@@ -26,6 +26,27 @@ rest_command:
         {% if camera_entity is defined %}, "camera_entity": "{{ camera_entity }}"{% endif %}
       }
 
+  # Live sensor popup: opens a persistent window on the desktop showing
+  # current values for the listed sensors, refreshed every refresh_s seconds.
+  # Stays open until closed (window close button) or until close_entity
+  # reaches one of the close_states (timeout_ms defaults to 0 = never).
+  desktop_sensor_popup:
+    url: "http://{{ states('sensor.hanotifications_host') }}:{{ state_attr('sensor.hanotifications_host', 'port') | default(8765, true) }}/notify"
+    method: POST
+    headers:
+      Authorization: "Bearer change-me-to-a-random-string"
+      Content-Type: "application/json"
+    payload: >-
+      {
+        "title": "{{ title }}",
+        "message": "{{ message | default('') }}",
+        "sensors": {{ sensors | tojson }},
+        "refresh_s": {{ refresh_s | default(5) }},
+        "timeout_ms": {{ timeout_ms | default(0) }}
+        {% if close_entity is defined %}, "close_entity": "{{ close_entity }}"{% endif %}
+        {% if close_states is defined %}, "close_states": {{ close_states | tojson }}{% endif %}
+      }
+
   # Used by the heartbeat automation below to prove to hanotifications that
   # HA can still reach it. If this stops firing, the tray icon goes grey.
   hanotifications_heartbeat:

@@ -344,6 +344,220 @@ except OSError:
 root.mainloop()
 """
 
+# ---------------------------------------------------------------------------
+# Live sensor popup script (run in a subprocess for isolation)
+#
+# Persistent window showing current values for a list of HA sensors,
+# refreshed by polling the HA REST API. Built for "keep an eye on this"
+# scenarios like a power outage: show battery draw + time remaining while
+# on battery, auto-close when grid power returns.
+# ---------------------------------------------------------------------------
+
+_SENSOR_POPUP_SCRIPT = r"""
+import json, ssl, sys, threading, time, urllib.request
+try:
+    import tkinter as tk
+except ImportError as exc:
+    print(f"sensor popup: missing dependency: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+data          = json.loads(sys.argv[1])
+title         = data['title']
+body          = data.get('body', '')
+sensors       = data['sensors']
+refresh_s     = max(2, int(data.get('refresh_s', 5)))
+timeout_ms    = int(data.get('timeout_ms', 0))
+close_entity  = data.get('close_entity') or ''
+close_states  = [str(s).lower() for s in data.get('close_states', [])]
+width         = int(data.get('width', 420))
+ha_url        = data.get('ha_url', '').rstrip('/')
+ha_token      = data.get('ha_token', '')
+ssl_verify    = data.get('ha_ssl_verify', True)
+
+ctx = None
+if ha_url.startswith('https') and not ssl_verify:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+
+def fetch(entity):
+    req = urllib.request.Request(f'{ha_url}/api/states/{entity}')
+    req.add_header('Authorization', f'Bearer {ha_token}')
+    with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+        return json.loads(resp.read())
+
+
+def format_value(state, unit):
+    # Duration sensors (e.g. discharge_time_remaining, which EcoFlow reports
+    # as decimal hours) read better as "11h 10m" than "11.1666666666667 h".
+    try:
+        if unit in ('min', 'minutes'):
+            m = int(float(state))
+            return f'{m // 60}h {m % 60:02d}m'
+        if unit in ('h', 'hr', 'hours'):
+            m = round(float(state) * 60)
+            return f'{m // 60}h {m % 60:02d}m'
+    except (TypeError, ValueError):
+        pass
+    # Trim float noise on other numeric states (1702.15 W -> 1702 W).
+    try:
+        f = float(state)
+        s = f'{f:.0f}' if abs(f) >= 100 else f'{round(f, 1):g}'
+        return f'{s} {unit}'.strip()
+    except (TypeError, ValueError):
+        pass
+    return f'{state} {unit}'.strip()
+
+
+def primary_screen_geom(tk_root):
+    # Same xrandr dance as the image popup: winfo_screenwidth() on X11 is
+    # the virtual-desktop span, which places popups on the wrong head.
+    import re, subprocess
+    try:
+        out = subprocess.check_output(
+            ['xrandr', '--query', '--current'],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode()
+        for line in out.splitlines():
+            if ' connected' in line and 'primary' in line.split()[:4]:
+                m = re.search(r'(\d+)x(\d+)\+(\d+)\+(\d+)', line)
+                if m:
+                    w, h, x, y = (int(v) for v in m.groups())
+                    return x, y, w, h
+    except Exception:
+        pass
+    return 0, 0, tk_root.winfo_screenwidth(), tk_root.winfo_screenheight()
+
+
+BG, FG, DIM, ACCENT, RULE = '#2b2b2b', 'white', '#aaaaaa', '#ffb84d', '#3d3d3d'
+
+# A real, WM-decorated window (unlike the image popup's overrideredirect
+# splash): draggable by its title bar, closable via the close button, but
+# still kept on top so the monitor stays visible.
+root = tk.Tk()
+root.title(title)
+root.attributes('-topmost', True)
+root.configure(bg=BG)
+root.resizable(False, False)
+
+frame = tk.Frame(root, bg=BG)
+frame.pack(fill='both', expand=True, padx=16, pady=12)
+
+tk.Label(frame, text=title, fg=ACCENT, bg=BG,
+         font=('Sans', 13, 'bold'), anchor='w').pack(fill='x')
+if body:
+    tk.Label(frame, text=body, fg=DIM, bg=BG, font=('Sans', 10),
+             wraplength=width - 40, justify='left', anchor='w'
+             ).pack(fill='x', pady=(2, 0))
+
+rows = {}
+for entity in sensors:
+    tk.Frame(frame, bg=RULE, height=1).pack(fill='x', pady=8)
+    name = tk.Label(frame, text=entity, fg=DIM, bg=BG,
+                    font=('Sans', 10), anchor='w')
+    name.pack(fill='x')
+    value = tk.Label(frame, text='…', fg=FG, bg=BG,
+                     font=('Sans', 22, 'bold'), anchor='w')
+    value.pack(fill='x')
+    rows[entity] = (name, value)
+
+status = tk.Label(frame, text='', fg='#666666', bg=BG,
+                  font=('Sans', 8), anchor='e')
+status.pack(fill='x', pady=(8, 0))
+
+
+_placed = False
+
+def size_and_place():
+    # Position only once (bottom-right of primary screen, above the KDE
+    # system tray); later refreshes adjust size only, so the window stays
+    # wherever the user dragged it.
+    global _placed
+    root.update_idletasks()
+    w = max(width, root.winfo_reqwidth())
+    h = root.winfo_reqheight()
+    if _placed:
+        root.geometry(f'{w}x{h}')
+        return
+    _placed = True
+    px, py, pw, ph = primary_screen_geom(root)
+    root.geometry(f'{w}x{h}+{px + pw - w - 20}+{py + ph - h - 60}')
+
+
+# tkinter isn't thread-safe, so the worker only writes into _shared under a
+# lock; the Tk thread picks changes up on a 500ms tick and touches widgets.
+_lock = threading.Lock()
+_shared = {'seq': 0, 'results': {}, 'close': False, 'any_ok': False}
+_applied_seq = 0
+
+
+def worker():
+    while True:
+        results, close_now, any_ok = {}, False, False
+        for entity in sensors:
+            try:
+                st = fetch(entity)
+                attrs = st.get('attributes') or {}
+                results[entity] = (
+                    attrs.get('friendly_name') or entity,
+                    format_value(st.get('state', '?'),
+                                 attrs.get('unit_of_measurement') or ''),
+                )
+                any_ok = True
+            except Exception:
+                results[entity] = None
+        if close_entity:
+            try:
+                if fetch(close_entity).get('state', '').lower() in close_states:
+                    close_now = True
+            except Exception:
+                pass
+        with _lock:
+            _shared['seq'] += 1
+            _shared['results'] = results
+            _shared['close'] = close_now
+            _shared['any_ok'] = any_ok
+        time.sleep(refresh_s)
+
+
+def tick():
+    global _applied_seq
+    with _lock:
+        seq, results = _shared['seq'], _shared['results']
+        close_now, any_ok = _shared['close'], _shared['any_ok']
+    if seq != _applied_seq:
+        _applied_seq = seq
+        for entity, res in results.items():
+            name, value = rows[entity]
+            if res is None:
+                # Keep the last value on screen but dim it to read as stale.
+                value.configure(fg=DIM)
+            else:
+                fname, text = res
+                name.configure(text=fname)
+                value.configure(text=text, fg=FG)
+        if any_ok:
+            status.configure(text=time.strftime('updated %H:%M:%S'))
+        else:
+            status.configure(text='Home Assistant unreachable')
+        size_and_place()
+        if close_now:
+            root.destroy()
+            return
+    root.after(500, tick)
+
+
+threading.Thread(target=worker, daemon=True).start()
+
+if timeout_ms > 0:
+    root.after(timeout_ms, root.destroy)
+
+size_and_place()
+tick()
+root.mainloop()
+"""
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -373,6 +587,24 @@ class Config:
         self.max_image_px: int = int(d.get("max_image_px", 512))
         # Width (px) of the custom image popup window; 0 = use standard notification
         self.image_popup_width: int = int(d.get("image_popup_width", 640))
+        # Width (px) of the live sensor popup window; 0 disables it (payloads
+        # with "sensors" then degrade to a standard text notification).
+        self.sensor_popup_width: int = int(d.get("sensor_popup_width", 420))
+        # Default seconds between HA polls while a sensor popup is open.
+        self.sensor_popup_refresh_s: int = int(d.get("sensor_popup_refresh_s", 5))
+        # Daemon-side popup triggers: watch entities over the HA websocket API
+        # and open a live sensor popup when one enters its open_states. Runs
+        # entirely on this side of the wire — no HA rest_command/automation
+        # needed. Each item: watch_entity, open_states, sensors, and optional
+        # title/message/refresh_s/timeout_ms/close_states.
+        self.sensor_popups: list[dict] = []
+        for w in d.get("sensor_popups") or []:
+            if not (isinstance(w, dict) and w.get("watch_entity")
+                    and w.get("open_states") and w.get("sensors")):
+                log.warning("Ignoring sensor_popups entry missing "
+                            "watch_entity/open_states/sensors: %r", w)
+                continue
+            self.sensor_popups.append(w)
         # When True, skip TLS verification for self-signed HA certs
         self.ha_ssl_verify: bool = bool(d.get("ha_ssl_verify", True))
         # Show a KDE/Plasma system tray icon indicating HA reachability
@@ -464,6 +696,10 @@ class ViewerTokens:
 # but there's no reason for the secret-shaped value to live in logs at all.
 _TOKEN_LOG_RE = re.compile(r"([?&](?:token|access_token)=)[^&\s]+")
 
+# HA entity IDs are <domain>.<object_id>, lowercase alphanumerics/underscores.
+# Validated before entity IDs are interpolated into HA API URL paths.
+_ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
+
 
 class _MaskingAccessLogger(AbstractAccessLogger):
     """aiohttp access logger that masks auth tokens in the request line."""
@@ -488,6 +724,9 @@ class Notifier:
     def __init__(self, config: Config, viewer_tokens: "ViewerTokens | None" = None):
         self.cfg = config
         self.viewer_tokens = viewer_tokens
+        # popup_id -> Popen of live sensor popups, so a re-firing automation
+        # (grid sensor flapping) can't stack duplicate windows.
+        self._sensor_popups: dict[str, "subprocess.Popen"] = {}
 
     # -- image fetching ------------------------------------------------------
 
@@ -640,6 +879,61 @@ class Notifier:
         except Exception as exc:
             log.warning("Image popup launch failed: %s", exc)
             return False
+
+    # -- live sensor popup ---------------------------------------------------
+
+    def show_sensor_popup(self, title: str, body: str, sensors: list[str],
+                          refresh_s: int | None = None,
+                          timeout_ms: int | None = None,
+                          close_entity: str | None = None,
+                          close_states: list[str] | None = None,
+                          popup_id: str | None = None) -> bool:
+        """Open a persistent window showing live values for *sensors*.
+
+        The subprocess polls the HA REST API every refresh_s seconds. It stays
+        open until clicked, until timeout_ms elapses (0 = never, the default
+        for this popup type), or — when close_entity/close_states are given —
+        until that entity reaches one of those states (e.g. grid power back).
+        At most one popup per popup_id (default: title) is open at a time.
+        Returns False when the popup can't be shown (no tkinter / disabled).
+        """
+        import subprocess
+
+        if not (HAS_TKINTER and self.cfg.sensor_popup_width > 0):
+            return False
+
+        popup_id = popup_id or title
+        self._sensor_popups = {k: p for k, p in self._sensor_popups.items()
+                               if p.poll() is None}
+        if popup_id in self._sensor_popups:
+            log.info("Sensor popup %r already open — skipping duplicate", popup_id)
+            return True
+
+        payload = {
+            "title": title,
+            "body": body,
+            "sensors": sensors,
+            "refresh_s": refresh_s or self.cfg.sensor_popup_refresh_s,
+            "timeout_ms": timeout_ms if timeout_ms is not None else 0,
+            "close_entity": close_entity,
+            "close_states": close_states or [],
+            "width": self.cfg.sensor_popup_width,
+            "ha_url": self.cfg.ha_url,
+            "ha_token": self.cfg.ha_token,
+            "ha_ssl_verify": self.cfg.ha_ssl_verify,
+        }
+        try:
+            # Inherit stderr so subprocess warnings land in the journal.
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _SENSOR_POPUP_SCRIPT, json.dumps(payload)],
+                stdout=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except Exception as exc:
+            log.warning("Sensor popup launch failed: %s", exc)
+            return False
+        self._sensor_popups[popup_id] = proc
+        return True
 
     # -- notify-send fallback ------------------------------------------------
 
@@ -999,6 +1293,35 @@ class WebhookServer:
         urgency: str | None = data.get("urgency")
         timeout_ms: int | None = data.get("timeout_ms") or data.get("timeout")
 
+        # Live sensor popup: a "sensors" list routes to a persistent window
+        # that polls those entities, instead of a one-shot notification.
+        sensors = data.get("sensors")
+        if sensors:
+            if not (isinstance(sensors, list) and sensors
+                    and all(isinstance(s, str) and _ENTITY_ID_RE.fullmatch(s)
+                            for s in sensors)):
+                return web.Response(status=400,
+                                    text="sensors must be a list of entity IDs")
+            close_entity = data.get("close_entity")
+            if close_entity and not _ENTITY_ID_RE.fullmatch(close_entity):
+                return web.Response(status=400, text="Bad close_entity")
+            close_states = data.get("close_states") or data.get("close_state")
+            if isinstance(close_states, str):
+                close_states = [close_states]
+
+            log.info("Sensor popup: %r  sensors=%s  close=%s",
+                     title, sensors, close_entity)
+            if self.notifier.show_sensor_popup(
+                    title, message, sensors,
+                    refresh_s=data.get("refresh_s"),
+                    timeout_ms=timeout_ms,
+                    close_entity=close_entity,
+                    close_states=close_states,
+                    popup_id=data.get("popup_id")):
+                return web.Response(text="OK")
+            # tkinter missing or popup disabled — fall through and deliver
+            # the title/message as a standard notification instead.
+
         # Convenience: pass camera_entity instead of full image_url
         camera_entity: str | None = data.get("camera_entity")
         live_stream_url: str | None = None
@@ -1115,6 +1438,88 @@ class WebhookServer:
 
 
 # ---------------------------------------------------------------------------
+# Sensor popup watcher — daemon-side popup triggers over the HA websocket
+# ---------------------------------------------------------------------------
+
+def _open_watched_popup(notifier: Notifier, watch: dict, state: str) -> None:
+    opens = [str(s).lower() for s in watch.get("open_states", [])]
+    if str(state).lower() not in opens:
+        return
+    log.info("Watched entity %s is %r — opening sensor popup",
+             watch["watch_entity"], state)
+    notifier.show_sensor_popup(
+        watch.get("title", "Home Assistant"),
+        watch.get("message", ""),
+        list(watch.get("sensors", [])),
+        refresh_s=watch.get("refresh_s"),
+        timeout_ms=watch.get("timeout_ms"),
+        close_entity=watch.get("close_entity") or watch["watch_entity"],
+        close_states=watch.get("close_states"),
+    )
+
+
+async def _watch_sensor_popups_once(cfg: Config, notifier: Notifier) -> None:
+    """One websocket session: auth, check current states, then react to
+    state_changed events until the connection drops (caller reconnects)."""
+    ws_url = cfg.ha_url.rstrip('/').replace('http', 'ws', 1) + '/api/websocket'
+    ssl_arg = None if cfg.ha_ssl_verify else False
+    watched = {w["watch_entity"]: w for w in cfg.sensor_popups}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url, ssl=ssl_arg, heartbeat=30) as ws:
+            hello = await ws.receive_json()
+            if hello.get("type") != "auth_required":
+                raise RuntimeError(f"unexpected hello: {hello.get('type')}")
+            await ws.send_json({"type": "auth", "access_token": cfg.ha_token})
+            ok = await ws.receive_json()
+            if ok.get("type") != "auth_ok":
+                raise RuntimeError("HA websocket auth failed")
+
+            await ws.send_json({"id": 1, "type": "subscribe_events",
+                                "event_type": "state_changed"})
+            # Initial sweep so a popup opens even if the daemon (re)starts
+            # mid-outage, when the interesting transition already happened.
+            await ws.send_json({"id": 2, "type": "get_states"})
+            log.info("Sensor popup watcher connected (%d watch(es))",
+                     len(watched))
+
+            while True:
+                data = await ws.receive_json()
+                t = data.get("type")
+                if t == "result":
+                    if not data.get("success", True):
+                        raise RuntimeError(f"HA WS command failed: {data}")
+                    if data.get("id") == 2:
+                        for st in data.get("result") or []:
+                            w = watched.get(st.get("entity_id"))
+                            if w:
+                                _open_watched_popup(notifier, w,
+                                                    st.get("state", ""))
+                elif t == "event":
+                    ev = (data.get("event") or {}).get("data") or {}
+                    w = watched.get(ev.get("entity_id"))
+                    if w:
+                        new_state = (ev.get("new_state") or {}).get("state", "")
+                        _open_watched_popup(notifier, w, new_state)
+
+
+async def watch_sensor_popups(cfg: Config, notifier: Notifier) -> None:
+    """Keep a watcher session alive for the life of the daemon."""
+    if not cfg.sensor_popups:
+        return
+    while True:
+        try:
+            await _watch_sensor_popups_once(cfg, notifier)
+            log.warning("Sensor popup watcher: HA closed the connection — "
+                        "reconnecting in 15s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Sensor popup watcher: %s — reconnecting in 15s", exc)
+        await asyncio.sleep(15)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1132,11 +1537,13 @@ async def run_server(cfg: Config, notifier: Notifier, health: HealthState,
     await runner.setup()
     site = web.TCPSite(runner, cfg.host, cfg.port)
     await site.start()
+    watcher = asyncio.create_task(watch_sensor_popups(cfg, notifier))
     log.info("Ready.")
 
     try:
         await stop.wait()
     finally:
+        watcher.cancel()
         await runner.cleanup()
 
 

@@ -77,8 +77,8 @@ sensor_popup_refresh_s: 5
 #    close_states: ["grid_in", "feed_grid"]
 #    title: "⚡ Power Outage — On Battery"
 #    message: "House is running on battery backup."
-#    sensors:
-#      - sensor.ef_shp30295_system_load
+#    sensors:                # an inner list renders those entities side by side
+#      - [sensor.ef_shp30295_system_load, sensor.ef_shp30295_battery_level]
 #      - sensor.ef_shp30295_discharge_time_remaining
 #    refresh_s: 5
 

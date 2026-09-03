@@ -364,7 +364,11 @@ except ImportError as exc:
 data          = json.loads(sys.argv[1])
 title         = data['title']
 body          = data.get('body', '')
-sensors       = data['sensors']
+# Each item is an entity ID (its own row) or a list of entity IDs rendered
+# side by side in one row (e.g. [load, battery %] above time remaining).
+rows_spec     = [[e] if isinstance(e, str) else list(e)
+                 for e in data['sensors']]
+sensors       = [e for row in rows_spec for e in row]
 refresh_s     = max(2, int(data.get('refresh_s', 5)))
 timeout_ms    = int(data.get('timeout_ms', 0))
 close_entity  = data.get('close_entity') or ''
@@ -410,6 +414,22 @@ def format_value(state, unit):
     return f'{state} {unit}'.strip()
 
 
+def strip_common_prefix(names):
+    # Friendly names from one device share a long prefix ("EcoFlow Smart
+    # Home Panel 3 System Load" / "... Battery Level"); drop the leading
+    # words common to every name so labels read as "System Load". Only
+    # whole words are stripped, and every name must keep at least one.
+    words = {e: n.split() for e, n in names.items()}
+    if len(words) < 2:
+        return dict(names)
+    common = 0
+    lists = list(words.values())
+    while all(len(w) > common + 1 for w in lists) and \
+            len({w[common] for w in lists}) == 1:
+        common += 1
+    return {e: ' '.join(w[common:]) for e, w in words.items()}
+
+
 def primary_screen_geom(tk_root):
     # Same xrandr dance as the image popup: winfo_screenwidth() on X11 is
     # the virtual-desktop span, which places popups on the wrong head.
@@ -452,15 +472,26 @@ if body:
              ).pack(fill='x', pady=(2, 0))
 
 rows = {}
-for entity in sensors:
+for row_entities in rows_spec:
     tk.Frame(frame, bg=RULE, height=1).pack(fill='x', pady=8)
-    name = tk.Label(frame, text=entity, fg=DIM, bg=BG,
-                    font=('Sans', 10), anchor='w')
-    name.pack(fill='x')
-    value = tk.Label(frame, text='…', fg=FG, bg=BG,
-                     font=('Sans', 22, 'bold'), anchor='w')
-    value.pack(fill='x')
-    rows[entity] = (name, value)
+    # One grid per row: names on line 0, values on line 1, so values stay
+    # aligned across columns even when a friendly name wraps to two lines.
+    # Names wrap at the column width rather than widening the window.
+    row = tk.Frame(frame, bg=BG)
+    row.pack(fill='x')
+    ncols = len(row_entities)
+    gap = 12
+    col_w = max(80, (width - 32 - gap * (ncols - 1)) // ncols)
+    for col, entity in enumerate(row_entities):
+        row.columnconfigure(col, weight=1, uniform='cols')
+        padx = (0, gap) if col < ncols - 1 else 0
+        name = tk.Label(row, text=entity, fg=DIM, bg=BG, font=('Sans', 10),
+                        anchor='sw', justify='left', wraplength=col_w)
+        name.grid(row=0, column=col, sticky='ews', padx=padx)
+        value = tk.Label(row, text='…', fg=FG, bg=BG,
+                         font=('Sans', 22, 'bold'), anchor='w')
+        value.grid(row=1, column=col, sticky='ew', padx=padx)
+        rows[entity] = (name, value)
 
 status = tk.Label(frame, text='', fg='#666666', bg=BG,
                   font=('Sans', 8), anchor='e')
@@ -490,6 +521,7 @@ def size_and_place():
 _lock = threading.Lock()
 _shared = {'seq': 0, 'results': {}, 'close': False, 'any_ok': False}
 _applied_seq = 0
+_names = {}   # entity -> last-known friendly name (worker thread only)
 
 
 def worker():
@@ -499,14 +531,16 @@ def worker():
             try:
                 st = fetch(entity)
                 attrs = st.get('attributes') or {}
-                results[entity] = (
-                    attrs.get('friendly_name') or entity,
-                    format_value(st.get('state', '?'),
-                                 attrs.get('unit_of_measurement') or ''),
-                )
+                _names[entity] = attrs.get('friendly_name') or entity
+                results[entity] = format_value(
+                    st.get('state', '?'),
+                    attrs.get('unit_of_measurement') or '')
                 any_ok = True
             except Exception:
                 results[entity] = None
+        labels = strip_common_prefix(_names)
+        results = {e: (labels[e], v) if v is not None else None
+                   for e, v in results.items()}
         if close_entity:
             try:
                 if fetch(close_entity).get('state', '').lower() in close_states:
@@ -604,7 +638,13 @@ class Config:
                 log.warning("Ignoring sensor_popups entry missing "
                             "watch_entity/open_states/sensors: %r", w)
                 continue
-            self.sensor_popups.append(w)
+            sensors = _normalize_sensor_rows(w["sensors"])
+            if sensors is None:
+                log.warning("Ignoring sensor_popups entry with bad sensors "
+                            "(expected entity IDs or lists of entity IDs "
+                            "for side-by-side rows): %r", w.get("sensors"))
+                continue
+            self.sensor_popups.append({**w, "sensors": sensors})
         # When True, skip TLS verification for self-signed HA certs
         self.ha_ssl_verify: bool = bool(d.get("ha_ssl_verify", True))
         # Show a KDE/Plasma system tray icon indicating HA reachability
@@ -699,6 +739,30 @@ _TOKEN_LOG_RE = re.compile(r"([?&](?:token|access_token)=)[^&\s]+")
 # HA entity IDs are <domain>.<object_id>, lowercase alphanumerics/underscores.
 # Validated before entity IDs are interpolated into HA API URL paths.
 _ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
+
+
+def _normalize_sensor_rows(sensors) -> list[str | list[str]] | None:
+    """Validate a sensor-popup ``sensors`` list.
+
+    Each item is either an entity ID (rendered on its own row) or a non-empty
+    list of entity IDs (rendered side by side in one row). Returns the list
+    with row-lists coerced to plain lists, or None if anything is malformed.
+    """
+    if not isinstance(sensors, list) or not sensors:
+        return None
+    out: list[str | list[str]] = []
+    for item in sensors:
+        if isinstance(item, str):
+            if not _ENTITY_ID_RE.fullmatch(item):
+                return None
+            out.append(item)
+        elif (isinstance(item, (list, tuple)) and item
+              and all(isinstance(e, str) and _ENTITY_ID_RE.fullmatch(e)
+                      for e in item)):
+            out.append(list(item))
+        else:
+            return None
+    return out
 
 
 class _MaskingAccessLogger(AbstractAccessLogger):
@@ -882,7 +946,8 @@ class Notifier:
 
     # -- live sensor popup ---------------------------------------------------
 
-    def show_sensor_popup(self, title: str, body: str, sensors: list[str],
+    def show_sensor_popup(self, title: str, body: str,
+                          sensors: list[str | list[str]],
                           refresh_s: int | None = None,
                           timeout_ms: int | None = None,
                           close_entity: str | None = None,
@@ -890,7 +955,9 @@ class Notifier:
                           popup_id: str | None = None) -> bool:
         """Open a persistent window showing live values for *sensors*.
 
-        The subprocess polls the HA REST API every refresh_s seconds. It stays
+        Each item in *sensors* is an entity ID shown on its own row, or a
+        list of entity IDs shown side by side in one row (already validated
+        by _normalize_sensor_rows). The subprocess polls the HA REST API every refresh_s seconds. It stays
         open until clicked, until timeout_ms elapses (0 = never, the default
         for this popup type), or — when close_entity/close_states are given —
         until that entity reaches one of those states (e.g. grid power back).
@@ -1297,11 +1364,12 @@ class WebhookServer:
         # that polls those entities, instead of a one-shot notification.
         sensors = data.get("sensors")
         if sensors:
-            if not (isinstance(sensors, list) and sensors
-                    and all(isinstance(s, str) and _ENTITY_ID_RE.fullmatch(s)
-                            for s in sensors)):
-                return web.Response(status=400,
-                                    text="sensors must be a list of entity IDs")
+            sensors = _normalize_sensor_rows(sensors)
+            if sensors is None:
+                return web.Response(
+                    status=400,
+                    text="sensors must be a list of entity IDs "
+                         "(or lists of entity IDs for side-by-side rows)")
             close_entity = data.get("close_entity")
             if close_entity and not _ENTITY_ID_RE.fullmatch(close_entity):
                 return web.Response(status=400, text="Bad close_entity")

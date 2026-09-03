@@ -311,7 +311,7 @@ Including a `sensors` list in the payload switches from a one-shot notification 
 
 | Field | Type | Description |
 |---|---|---|
-| `sensors` | list of strings | Entity IDs to display. Presence of this field selects the sensor popup |
+| `sensors` | list | Entity IDs to display, one per row. An item that is itself a list of entity IDs renders those side by side in one row (e.g. `[load, battery %]` above time remaining). Presence of this field selects the sensor popup |
 | `refresh_s` | integer | Seconds between HA polls. Defaults to `sensor_popup_refresh_s` (5) |
 | `timeout_ms` | integer | Defaults to `0` for this popup type — stays open until dismissed |
 | `close_entity` | string | Optional entity to watch; the popup closes itself when it reaches one of `close_states` |
@@ -321,6 +321,7 @@ Including a `sensors` list in the payload switches from a one-shot notification 
 Behavior details:
 
 - Values render as `<state> <unit>`, with duration sensors (unit `min` or `h`) formatted as `11h 10m` and float noise trimmed on other numeric states
+- Labels are the entities' HA friendly names, with any leading words shared by every sensor in the popup stripped (so "EcoFlow Smart Home Panel 3 System Load" and "... Battery Level" show as "System Load" and "Battery Level")
 - Drag it anywhere; refreshes keep it where you put it. Close it any time with the window's close button
 - If HA becomes unreachable mid-outage, the last values stay on screen dimmed, with a "Home Assistant unreachable" footer, and polling keeps retrying
 - Requires `tkinter`; without it (or with `sensor_popup_width: 0`) the payload degrades to a standard text notification
@@ -337,7 +338,7 @@ sensor_popups:
     title: "⚡ Power Outage — On Battery"
     message: "House is running on battery backup."
     sensors:
-      - sensor.ef_shp30295_system_load
+      - [sensor.ef_shp30295_system_load, sensor.ef_shp30295_battery_level]
       - sensor.ef_shp30295_discharge_time_remaining
     refresh_s: 5
 ```
@@ -356,7 +357,7 @@ sensor_popups:
         title: "⚡ Power Outage — On Battery"
         message: "House is running on battery backup."
         sensors:
-          - sensor.ef_shp30295_system_load
+          - [sensor.ef_shp30295_system_load, sensor.ef_shp30295_battery_level]
           - sensor.ef_shp30295_discharge_time_remaining
         close_entity: sensor.ef_shp30295_grid_connection_status
         close_states: ["grid_in", "feed_grid"]
@@ -404,7 +405,7 @@ curl -X POST http://127.0.0.1:8765/notify \
 curl -X POST http://127.0.0.1:8765/notify \
   -H 'Authorization: Bearer YOUR_WEBHOOK_SECRET' \
   -H 'Content-Type: application/json' \
-  -d '{"title":"⚡ On Battery","sensors":["sensor.ef_shp30295_system_load","sensor.ef_shp30295_discharge_time_remaining"]}'
+  -d '{"title":"⚡ On Battery","sensors":[["sensor.ef_shp30295_system_load","sensor.ef_shp30295_battery_level"],"sensor.ef_shp30295_discharge_time_remaining"]}'
 
 # Health check (no auth required)
 curl http://127.0.0.1:8765/health

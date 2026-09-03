@@ -72,7 +72,8 @@
 # ---------------------------------------------------------------------------
 # 5. Power outage — live battery monitor window.
 #    When the house switches to battery backup, opens a persistent popup
-#    showing current battery draw and estimated runtime, refreshed every 5s.
+#    showing current battery draw and charge level side by side, with
+#    estimated runtime below, refreshed every 5s.
 #    The popup closes itself when grid power returns (close_entity reaches
 #    one of close_states); its window close button dismisses it early.
 #
@@ -90,7 +91,7 @@
         title: "⚡ Power Outage — On Battery"
         message: "House is running on battery backup."
         sensors:
-          - sensor.ef_shp30295_system_load
+          - [sensor.ef_shp30295_system_load, sensor.ef_shp30295_battery_level]
           - sensor.ef_shp30295_discharge_time_remaining
         refresh_s: 5
         close_entity: sensor.ef_shp30295_grid_connection_status

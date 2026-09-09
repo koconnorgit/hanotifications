@@ -19,6 +19,13 @@ import tempfile
 import time
 from pathlib import Path
 
+# yarl (pulled in by aiohttp) optionally imports pydantic for schema support.
+# We never use it, and a mismatched system pydantic / pydantic-core pair raises
+# SystemError on import (not ImportError), which yarl's try/except doesn't
+# catch and which would keep the daemon from starting. Mark pydantic as
+# unavailable so yarl skips that integration entirely.
+sys.modules.setdefault("pydantic", None)
+
 import aiohttp
 from aiohttp import web
 from aiohttp.abc import AbstractAccessLogger
@@ -99,8 +106,36 @@ _VIEWER_HTML = '''<!DOCTYPE html>
 # Custom image popup script (run in a subprocess for isolation)
 # ---------------------------------------------------------------------------
 
+def _spawn_with_payload(script: str, payload: dict) -> "subprocess.Popen":
+    """Run *script* in a child interpreter, handing it *payload* on stdin.
+
+    The payload may include the HA token; argv is world-readable via
+    /proc/<pid>/cmdline, stdin is not. The child reads all of stdin before
+    doing anything else, and the JSON is far smaller than the pipe buffer,
+    so the write never blocks. stderr is inherited so subprocess warnings
+    land in the daemon's journal.
+    """
+    import json
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        proc.stdin.write(json.dumps(payload).encode())
+    finally:
+        proc.stdin.close()
+    return proc
+
+
 _POPUP_SCRIPT = r"""
 import sys, os, json, shutil, subprocess, tempfile, threading, asyncio
+# Same guard as the daemon: yarl's optional pydantic import can raise
+# SystemError (not ImportError) on a mismatched system install.
+sys.modules.setdefault("pydantic", None)
 try:
     import aiohttp
     HAS_AIOHTTP = True
@@ -113,7 +148,9 @@ except ImportError as exc:
     print(f"popup: missing dependency: {exc}", file=sys.stderr)
     sys.exit(1)
 
-data              = json.loads(sys.argv[1])
+# Payload arrives on stdin, not argv: it can carry the HA token, and argv
+# is world-readable via /proc/<pid>/cmdline.
+data              = json.loads(sys.stdin.read())
 title             = data['title']
 body              = data['body']
 path              = data['path']
@@ -361,7 +398,8 @@ except ImportError as exc:
     print(f"sensor popup: missing dependency: {exc}", file=sys.stderr)
     sys.exit(1)
 
-data          = json.loads(sys.argv[1])
+# Payload arrives on stdin, not argv (argv is world-readable via /proc).
+data          = json.loads(sys.stdin.read())
 title         = data['title']
 body          = data.get('body', '')
 # Each item is an entity ID (its own row) or a list of entity IDs rendered
@@ -930,15 +968,10 @@ class Notifier:
                     f"?token={vt}"
                     f"&entity={quote(camera_entity)}"
                 )
-        data = json.dumps(payload)
         try:
             # Inherit stderr so popup-subprocess warnings (HLS fetch failures,
             # mpv-not-found, etc.) land in the daemon's journal for debugging.
-            subprocess.Popen(
-                [sys.executable, "-c", _POPUP_SCRIPT, data],
-                stdout=subprocess.DEVNULL,
-                close_fds=True,
-            )
+            _spawn_with_payload(_POPUP_SCRIPT, payload)
             return True
         except Exception as exc:
             log.warning("Image popup launch failed: %s", exc)
@@ -991,11 +1024,7 @@ class Notifier:
         }
         try:
             # Inherit stderr so subprocess warnings land in the journal.
-            proc = subprocess.Popen(
-                [sys.executable, "-c", _SENSOR_POPUP_SCRIPT, json.dumps(payload)],
-                stdout=subprocess.DEVNULL,
-                close_fds=True,
-            )
+            proc = _spawn_with_payload(_SENSOR_POPUP_SCRIPT, payload)
         except Exception as exc:
             log.warning("Sensor popup launch failed: %s", exc)
             return False

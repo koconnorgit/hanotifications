@@ -132,7 +132,7 @@ def _spawn_with_payload(script: str, payload: dict) -> "subprocess.Popen":
 
 
 _POPUP_SCRIPT = r"""
-import sys, os, json, shutil, subprocess, tempfile, threading, asyncio
+import sys, os, json, shutil, socket, subprocess, tempfile, threading, time, asyncio
 # Same guard as the daemon: yarl's optional pydantic import can raise
 # SystemError (not ImportError) on a mismatched system install.
 sys.modules.setdefault("pydantic", None)
@@ -160,6 +160,8 @@ live_stream_url   = data.get('live_stream_url')
 live_stream_player = data.get('live_stream_player', 'mpv')
 live_stream_fps   = data.get('live_stream_fps', 2)
 live_stream_mode  = data.get('live_stream_mode', 'mpv')
+live_stream_on_click = data.get('live_stream_on_click', True)
+live_stream_in_popup = data.get('live_stream_in_popup', False)
 viewer_url        = data.get('viewer_url')
 ha_url            = data.get('ha_url', '')
 ha_token          = data.get('ha_token', '')
@@ -227,20 +229,29 @@ def launch_browser_view():
         print(f"popup: xdg-open failed: {exc}", file=sys.stderr)
 
 
-def launch_live_stream():
-    if not live_stream_url:
-        return
-    if live_stream_mode == 'browser':
-        launch_browser_view()
-        return
+def _unlink_quiet(p):
+    if p:
+        try: os.unlink(p)
+        except OSError: pass
+
+
+def build_player_cmd(extra_args=()):
+    '''Resolve the live stream and build the player argv.
+
+    Prefers HLS (true video, real framerate, audio when the camera provides
+    it); falls back to MJPEG polling if the WS handshake fails for any
+    reason. Returns (args, conf_path), or None if the player isn't on PATH.
+    conf_path is a 0600 temp file holding secrets kept off argv (None when
+    nothing secret is needed); the caller unlinks it once mpv has read it.
+    Blocks for up to the WS timeout, so callers on the Tk thread should
+    expect a pause.
+    '''
     player = shutil.which(live_stream_player) if live_stream_player else None
     if not player:
         print(f"popup: player {live_stream_player!r} not on PATH — skipping live stream",
               file=sys.stderr)
-        return
+        return None
 
-    # Prefer HLS (true video, real framerate, audio when the camera provides
-    # it). Fall back to MJPEG polling if the WS handshake fails for any reason.
     use_hls = False
     stream_url = live_stream_url
     hls_path = fetch_hls_url()
@@ -263,7 +274,7 @@ def launch_live_stream():
             if want_no_tls:
                 fh.write('tls-verify=no\n')
 
-    args = [player, '--mute=yes', '--force-window=yes', f'--title={title}']
+    args = [player, '--mute=yes', *extra_args]
     if use_hls:
         # HA emits LL-HLS with 10s full segments + 0.9s EXT-X-PART chunks.
         # ffmpeg's HLS demuxer ignores parts (as of 8.x), so the best we
@@ -289,23 +300,174 @@ def launch_live_stream():
     if conf_path:
         args.append(f'--include={conf_path}')
     args.append(stream_url)
+    return args, conf_path
 
+
+def launch_live_stream():
+    if not live_stream_url:
+        return
+    if live_stream_mode == 'browser':
+        launch_browser_view()
+        return
+    cmd = build_player_cmd(['--force-window=yes', f'--title={title}'])
+    if not cmd:
+        return
+    args, conf_path = cmd
     try:
         subprocess.Popen(args, start_new_session=True,
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, close_fds=True)
     except Exception as exc:
         print(f"popup: player launch failed: {exc}", file=sys.stderr)
-        if conf_path:
-            try: os.unlink(conf_path)
-            except OSError: pass
+        _unlink_quiet(conf_path)
         return
-
     if conf_path:
-        def _cleanup():
-            try: os.unlink(conf_path)
-            except OSError: pass
-        threading.Timer(2.0, _cleanup).start()
+        threading.Timer(2.0, _unlink_quiet, args=(conf_path,)).start()
+
+
+# ---- embedded live stream ---------------------------------------------------
+# With live_stream_in_popup the feed starts as soon as the popup opens, in an
+# mpv rendering into a Tk frame via --wid. The snapshot stays on screen until
+# mpv has a real frame up (the vo-configured property over its IPC socket),
+# then the frame is swapped in where the image was. Clicks land on mpv's own
+# X child window rather than Tk, so a MBTN_LEFT keybind relays them back.
+#
+# tkinter isn't thread-safe, so the stream thread only writes into _live
+# under a lock; the Tk thread picks changes up on a tick and touches widgets.
+_live_lock = threading.Lock()
+_live = {'proc': None, 'ready': False, 'clicked': False, 'exited': False,
+         'sock_path': None, 'conf_path': None, 'url': None}
+
+
+def live_ipc_send(command):
+    '''Fire one command at mpv over a fresh IPC connection (mpv accepts
+    many clients). Called from the Tk thread; never blocks on a reply.'''
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(1.0)
+        s.connect(_live['sock_path'])
+        s.sendall(json.dumps({'command': command}).encode() + b'\n')
+        s.close()
+    except OSError as exc:
+        print(f"popup: mpv IPC send failed: {exc}", file=sys.stderr)
+
+
+def go_live():
+    '''Jump to the live edge by reloading the stream.
+
+    On cold start the popup catches HA's playlist while the first segment
+    is still being written, so mpv starts at the beginning of it and stays
+    that far behind. Reloading once the playlist has parts lands at HA's
+    EXT-X-START offset, ~2s from the edge. Seeking can't do this: ffmpeg's
+    HLS demuxer seeks to segment boundaries, which is no better.
+    '''
+    with _live_lock:
+        url = _live['url']
+    if url:
+        live_ipc_send(['loadfile', url, 'replace'])
+
+
+def _live_ipc(proc, sock_path):
+    '''Talk to mpv's JSON IPC socket until it closes (=mpv exited).'''
+    s = None
+    for _ in range(50):  # mpv creates the socket shortly after start
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.connect(sock_path)
+            break
+        except OSError:
+            s = None
+            if proc.poll() is not None:
+                print(f"popup: embedded player exited before playing "
+                      f"(rc={proc.returncode})", file=sys.stderr)
+                return
+            time.sleep(0.1)
+    if s is None:
+        print("popup: mpv IPC socket never appeared", file=sys.stderr)
+        return
+    try:
+        s.sendall(b'{"command":["observe_property",1,"vo-configured"]}\n'
+                  b'{"command":["keybind","MBTN_LEFT","script-message popup-click"]}\n')
+        buf = b''
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            while b'\n' in buf:
+                line, buf = buf.split(b'\n', 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                ev = msg.get('event')
+                if ev == 'property-change' and msg.get('name') == 'vo-configured':
+                    # Drops to false while a reload (go_live) is in flight.
+                    with _live_lock:
+                        _live['ready'] = bool(msg.get('data'))
+                elif ev == 'client-message' and msg.get('args') == ['popup-click']:
+                    with _live_lock:
+                        _live['clicked'] = True
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def _live_worker(wid):
+    try:
+        cmd = build_player_cmd([
+            f'--wid={wid}',
+            f'--input-ipc-server={_live["sock_path"]}',
+            # Bare video: no OSC/OSD, no default key bindings (the popup has
+            # no keyboard focus anyway), keep-open=no so a dead stream exits
+            # rather than freezing on the last frame.
+            '--no-osc', '--no-osd-bar', '--osd-level=0',
+            '--input-default-bindings=no', '--input-vo-keyboard=no',
+            '--keep-open=no',
+        ])
+        if not cmd:
+            return
+        args, conf_path = cmd
+        # Tk is X11-only, so under a Wayland session it lives in XWayland;
+        # hide WAYLAND_DISPLAY so mpv picks an X11 backend too — the Wayland
+        # one can't embed into an X window and silently ignores --wid.
+        env = {k: v for k, v in os.environ.items() if k != 'WAYLAND_DISPLAY'}
+        env['DISABLE_MANGOHUD'] = '1'  # no FPS overlay on a notification
+        try:
+            proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, close_fds=True)
+        except Exception as exc:
+            print(f"popup: embedded player launch failed: {exc}", file=sys.stderr)
+            _unlink_quiet(conf_path)
+            return
+        with _live_lock:
+            _live['proc'] = proc
+            _live['conf_path'] = conf_path
+            _live['url'] = args[-1]
+        if conf_path:
+            threading.Timer(2.0, _unlink_quiet, args=(conf_path,)).start()
+        _live_ipc(proc, _live['sock_path'])
+    finally:
+        with _live_lock:
+            _live['exited'] = True
+
+
+def start_embedded_stream(wid):
+    _live['sock_path'] = tempfile.mktemp(prefix='hanofy_mpv_', suffix='.sock', dir='/tmp')
+    threading.Thread(target=_live_worker, args=(wid,), daemon=True).start()
+
+
+def stop_embedded_stream():
+    with _live_lock:
+        proc, sock_path, conf_path = _live['proc'], _live['sock_path'], _live['conf_path']
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    _unlink_quiet(sock_path)
+    _unlink_quiet(conf_path)
 
 def primary_screen_geom(tk_root):
     # Returns (x, y, w, h) of the primary monitor. Prefers xrandr so we get
@@ -337,6 +499,8 @@ root.attributes('-topmost', True)
 root.configure(bg='#2b2b2b')
 root.resizable(False, False)
 
+img_label = None
+video_frame = None
 try:
     img = Image.open(path).convert('RGB')
     iw, ih = img.size
@@ -346,12 +510,31 @@ try:
         # Scale up small images to fill the configured width
         img = img.resize((width, int(ih * width / iw)), Image.LANCZOS)
     photo = ImageTk.PhotoImage(img)
-    tk.Label(root, image=photo, bg='#2b2b2b', cursor='hand2').pack(padx=0, pady=0)
+    img_label = tk.Label(root, image=photo, bg='#2b2b2b', cursor='hand2')
+    img_label.pack(padx=0, pady=0)
+    if live_stream_in_popup and live_stream_url and live_stream_player:
+        # Same footprint as the snapshot so the swap doesn't resize the
+        # popup. Not packed until mpv has a frame up; it still gets an X
+        # window ID for --wid to attach to.
+        video_frame = tk.Frame(root, width=img.width, height=img.height,
+                               bg='black', cursor='hand2')
 except Exception as exc:
     print(f"popup: image load error: {exc}", file=sys.stderr)
 
-tk.Label(root, text=title, fg='white', bg='#2b2b2b',
-         font=('Sans', 11, 'bold'), anchor='w').pack(fill='x', padx=10, pady=(6, 2))
+title_row = tk.Frame(root, bg='#2b2b2b')
+title_row.pack(fill='x', padx=10, pady=(6, 2))
+tk.Label(title_row, text=title, fg='white', bg='#2b2b2b',
+         font=('Sans', 11, 'bold'), anchor='w').pack(side='left', fill='x', expand=True)
+# "Go live" sits at the right of the title row (Tk can't draw over mpv's X
+# child window) and is only packed while the live feed is showing. Dropping
+# the toplevel from its bindtags keeps the popup-wide <Button-1> dismiss
+# binding from firing on it.
+live_btn = tk.Button(title_row, text='Go live', command=lambda: go_live(),
+                     fg='white', bg='#444444', activeforeground='white',
+                     activebackground='#555555', relief='flat', bd=0,
+                     padx=8, pady=1, font=('Sans', 9), cursor='hand2',
+                     highlightthickness=0, disabledforeground='#888888')
+live_btn.bindtags((str(live_btn), 'Button', 'all'))
 if body:
     tk.Label(root, text=body, fg='#aaaaaa', bg='#2b2b2b',
              font=('Sans', 10), wraplength=width - 20, anchor='w',
@@ -366,19 +549,71 @@ x = px + pw - w - 20
 y = py + ph - h - 60
 root.geometry(f'{w}x{h}+{x}+{y}')
 
-def on_click(_e):
-    launch_live_stream()
+_dismiss_id = None
+
+def arm_dismiss():
+    # 0 = never auto-dismiss.
+    global _dismiss_id
+    if _dismiss_id is not None:
+        root.after_cancel(_dismiss_id)
+        _dismiss_id = None
+    if timeout > 0:
+        _dismiss_id = root.after(timeout, root.destroy)
+
+def on_click(_e=None):
+    if live_stream_on_click:
+        launch_live_stream()
     root.destroy()
 
 root.bind('<Button-1>', on_click)
-root.after(timeout, root.destroy)
+arm_dismiss()
+
+_live_shown = False
+
+def live_tick():
+    global _live_shown
+    with _live_lock:
+        ready, clicked, exited = _live['ready'], _live['clicked'], _live['exited']
+    if clicked:
+        on_click()
+        return
+    if exited:
+        # Stream died (or never started): put the snapshot back and leave
+        # the popup on its normal timeout.
+        if _live_shown:
+            img_label.pack(before=video_frame)
+            video_frame.pack_forget()
+            live_btn.pack_forget()
+            _live_shown = False
+        return
+    if ready and not _live_shown:
+        video_frame.pack(before=img_label)
+        img_label.pack_forget()
+        live_btn.pack(side='right')
+        _live_shown = True
+        # Restart the clock so the user gets the full timeout of live video,
+        # not whatever was left after the stream's start-up.
+        arm_dismiss()
+    if _live_shown:
+        # Greyed while a go_live reload is bringing up its first frame.
+        live_btn.configure(state='normal' if ready else 'disabled',
+                           text='Go live' if ready else 'Loading…')
+    root.after(100, live_tick)
+
+if video_frame is not None:
+    start_embedded_stream(video_frame.winfo_id())
+    root.after(100, live_tick)
 
 try:
     os.unlink(path)
 except OSError:
     pass
 
-root.mainloop()
+try:
+    root.mainloop()
+finally:
+    if video_frame is not None:
+        stop_embedded_stream()
 """
 
 # ---------------------------------------------------------------------------
@@ -712,6 +947,12 @@ class Config:
         # the daemon's /viewer page, which plays the same HLS via hls.js —
         # part-aware, so it matches HA's own UI ~2s latency.
         self.live_stream_mode: str = d.get("live_stream_mode", "mpv")
+        # When True, a camera-snapshot popup starts the live feed immediately
+        # in an mpv embedded in the popup window itself (via --wid); the
+        # snapshot is swapped for live video once mpv has a frame up. Uses
+        # live_stream_player; independent of live_stream_mode, which still
+        # governs what a click does.
+        self.live_stream_in_popup: bool = bool(d.get("live_stream_in_popup", False))
 
 
 # ---------------------------------------------------------------------------
@@ -929,8 +1170,10 @@ class Notifier:
 
         The subprocess takes ownership of *image_path* and unlinks it when done.
         If *live_stream_url* is given, clicking the popup also spawns the
-        configured live-stream player on that URL; *camera_entity* lets the
-        popup request a signed HLS URL from HA instead of the MJPEG fallback.
+        configured live-stream player on that URL (live_stream_on_click),
+        and/or the popup embeds the feed in place of the snapshot
+        (live_stream_in_popup); *camera_entity* lets the popup request a
+        signed HLS URL from HA instead of the MJPEG fallback.
         Returns True if the subprocess was launched successfully.
         """
         import subprocess
@@ -943,8 +1186,11 @@ class Notifier:
             "width": self.cfg.image_popup_width,
             "timeout_ms": timeout_ms,
         }
-        if live_stream_url and self.cfg.live_stream_on_click:
+        if live_stream_url and (self.cfg.live_stream_on_click
+                                or self.cfg.live_stream_in_popup):
             payload["live_stream_url"] = live_stream_url
+            payload["live_stream_on_click"] = self.cfg.live_stream_on_click
+            payload["live_stream_in_popup"] = self.cfg.live_stream_in_popup
             payload["live_stream_player"] = self.cfg.live_stream_player
             payload["live_stream_fps"] = self.cfg.live_stream_fps
             payload["live_stream_mode"] = self.cfg.live_stream_mode
@@ -960,6 +1206,7 @@ class Notifier:
             # NOT webhook_secret, so the URL (visible in browser history,
             # ps argv, etc.) carries nothing reusable after the TTL.
             if (self.cfg.live_stream_mode == "browser" and camera_entity
+                    and self.cfg.live_stream_on_click
                     and self.viewer_tokens is not None):
                 from urllib.parse import quote
                 vt = self.viewer_tokens.issue(camera_entity)
@@ -1440,8 +1687,11 @@ class WebhookServer:
         # cold-start (FFmpeg spinning up against the source RTSP) is the
         # bulk of the click-to-play delay; firing camera/stream here pays
         # that cost in the background. HA dedupes concurrent stream
-        # requests, so the later /viewer fetch reuses the same worker.
-        if camera_entity and self.cfg.live_stream_mode == "browser":
+        # requests, so the later /viewer fetch reuses the same worker. Same
+        # payoff for the embedded popup player, which asks for the stream
+        # only after the snapshot has been fetched and the window is up.
+        if camera_entity and (self.cfg.live_stream_mode == "browser"
+                              or self.cfg.live_stream_in_popup):
             asyncio.create_task(self._fetch_hls_url(camera_entity))
 
         # Fire and forget — respond immediately so HA doesn't time out

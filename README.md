@@ -28,7 +28,7 @@ hanotifications  (aiohttp webhook server, systemd user service)
 - The service authenticates the request, optionally fetches a camera snapshot from the HA API using a long-lived token, then displays a notification
 - **When an image is present** (and `tkinter` + `Pillow` are available), a custom popup window appears in the bottom-right corner of the primary monitor, showing the image at configurable full width — much larger than a standard notification thumbnail
 - **Without an image**, or if tkinter is unavailable, a native KDE Plasma notification is used via the D-Bus `image-data` hint; falls back to `notify-send -i` if `python-dbus` or `Pillow` are also unavailable
-- **Click to livestream** — clicking a camera-snapshot popup opens the live feed, either in a standalone `mpv` window (default) or in a browser tab served by the daemon's `/viewer` endpoint (`live_stream_mode: browser`, ~2 s latency via hls.js). See [Click-to-livestream](#click-to-livestream-camera-popups) below.
+- **Click to livestream** — clicking a camera-snapshot popup opens the live feed, either in a standalone `mpv` window (default) or in a browser tab served by the daemon's `/viewer` endpoint (`live_stream_mode: browser`, ~2 s latency via hls.js). With `live_stream_in_popup: true` the feed instead starts immediately, embedded in the popup, replacing the snapshot once it's playing. See [Click-to-livestream](#click-to-livestream-camera-popups) below.
 - **Live sensor popup** — payloads with a `sensors` list open a persistent monitor window showing current values polled from the HA API (e.g. battery draw + runtime during a power outage), auto-closing when a watched entity recovers. See [Live sensor popup](#live-sensor-popup) below.
 - **Optional tray icon** — when `system_tray: true` is set, a Home Assistant icon appears in the KDE/Plasma system tray; blue when HA is reachable, grey with a red diagonal slash when it is not. Supports an inbound heartbeat from HA for detecting one-way outages. See [System tray icon](#system-tray-icon-optional) below.
 
@@ -46,7 +46,7 @@ hanotifications  (aiohttp webhook server, systemd user service)
 | `python-pyqt6` | optional | KDE/Plasma system tray icon (only used when `system_tray: true`) |
 | `python-dbus` | optional | D-Bus notifications with embedded images (text-only fallback if absent) |
 | `libnotify` | optional | `notify-send` fallback when D-Bus is unavailable |
-| `mpv` | recommended | Click-to-livestream player under the default `live_stream_mode: mpv`. Not needed when `live_stream_mode: browser`. |
+| `mpv` | recommended | Click-to-livestream player under the default `live_stream_mode: mpv`, and the embedded player for `live_stream_in_popup`. Not needed when `live_stream_mode: browser` without in-popup video. |
 | web browser + `xdg-open` | optional | Required only for `live_stream_mode: browser`; loads `hls.js` from `cdn.jsdelivr.net` at viewer-page load time. |
 
 > **Without Pillow + tkinter:** image notifications fall back to a standard KDE Plasma notification with a small embedded thumbnail.
@@ -174,6 +174,11 @@ live_stream_fps: 2
 #                stream via hls.js (LL-HLS part-aware → matches HA's UI
 #                latency, ~2 s). No MJPEG fallback in this mode.
 live_stream_mode: "mpv"
+
+# Play the live feed inside the popup: starts as soon as the popup opens
+# and replaces the snapshot in place once the first frame is up. Requires
+# mpv. Clicks still follow live_stream_on_click / live_stream_mode.
+live_stream_in_popup: false
 ```
 
 ---
@@ -375,6 +380,16 @@ Two launch modes, controlled by `live_stream_mode`:
 - **`browser`** — `xdg-open`s a page served by the daemon at `/viewer` which plays the same HLS via `hls.js` in your default browser. `hls.js` **does** speak `EXT-X-PART`, so latency matches HA's own UI (~2 s). The viewer page lives fully on your loopback (`127.0.0.1:{port}`); the browser tab loads `hls.js` from the jsDelivr CDN (outbound internet needed only for that one script). The `/viewer` endpoint is gated by a short-lived (5 min) per-notification token so the `webhook_secret` never ends up in the browser URL, history, or Referer headers; the daemon's access log also masks `token=…` values. There is no MJPEG fallback in browser mode — if HLS init fails the page returns an error.
 
 In both modes playback starts muted so a motion alert doesn't suddenly play sound. Unmute in mpv mode by pressing `m` or clicking the OSC mute button; in browser mode use the HTML5 video controls.
+
+### Live feed inside the popup
+
+With `live_stream_in_popup: true`, the popup doesn't wait for a click: it requests the stream from HA the moment it opens and runs `mpv` embedded in the popup window (X11 `--wid` embedding into the Tk frame — works under Wayland too, since Tk lives in XWayland). The snapshot stays on screen until mpv reports its first rendered frame (`vo-configured` over its JSON IPC socket), then the live video replaces it in place at the same size, and the auto-dismiss timer restarts so you get the full `timeout_ms` of live video (`timeout_ms: 0` keeps it open until clicked). Typical snapshot-to-live time is a few seconds, dominated by HA's stream start-up; the daemon pre-warms HA's stream worker at notification time to shave that down.
+
+- Same stream selection as `mpv` mode: HLS via the WebSocket handshake, MJPEG fallback. Muted, no OSD/controls — it's a notification, not a player.
+- **Go live** button (title row, shown while the feed is up): on a cold start the popup often catches HA's playlist while the first segment is still being written, so mpv starts at the beginning of that segment and stays that far behind. The button reloads the stream, which lands at HA's `EXT-X-START` offset (~2 s from the live edge) now that the playlist has parts. Clicking it doesn't dismiss the popup.
+- Clicking anywhere on the popup (video included — mpv relays the click back over IPC) still does what `live_stream_on_click` / `live_stream_mode` say, so you can pop out to the full-size player or browser tab. Set `live_stream_on_click: false` if a click should just dismiss.
+- If the stream fails or drops, the snapshot stays (or comes back) and the popup closes on its normal timeout; the reason is logged to the journal.
+- Independent of `live_stream_mode`: you can keep `browser` for the click-through while the popup itself uses embedded mpv.
 
 Security notes:
 - `mpv` mode, MJPEG fallback path: the bearer token is passed to mpv via a short-lived `0600` include file in `/tmp` so it never appears on the command line. The HLS path uses the signed URL from HA and needs no token at mpv time.

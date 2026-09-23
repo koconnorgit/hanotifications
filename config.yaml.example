@@ -102,6 +102,16 @@ live_stream_player: "mpv"
 #                EXT-X-PART so latency matches HA's UI (~2 s).
 live_stream_mode: "mpv"
 
+# Play the live feed inside the popup itself. The stream starts as soon as
+# the popup opens, in an mpv embedded in the popup window; once the first
+# frame is up, it replaces the snapshot in place (the auto-dismiss timer
+# restarts at that point so you get the full timeout of live video). If the
+# stream fails, the snapshot simply stays. Requires mpv (live_stream_player).
+# Independent of live_stream_mode / live_stream_on_click, which still decide
+# what a click does — set live_stream_on_click: false if a click should just
+# dismiss the popup instead of also opening the full-size player.
+live_stream_in_popup: false
+
 # Frames-per-second hint for the MJPEG stream. MJPEG has no framerate metadata,
 # so mpv defaults to 25 fps — which makes low-fps HA cameras play in
 # fast-forward bursts. HA's camera_proxy_stream is typically ~2 fps. Raise for

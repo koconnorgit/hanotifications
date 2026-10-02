@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -336,7 +337,23 @@ def launch_live_stream():
 # under a lock; the Tk thread picks changes up on a tick and touches widgets.
 _live_lock = threading.Lock()
 _live = {'proc': None, 'ready': False, 'clicked': False, 'exited': False,
-         'sock_path': None, 'conf_path': None, 'url': None}
+         'stopping': False, 'sock_path': None, 'conf_path': None, 'url': None}
+
+# PR_SET_PDEATHSIG: have the kernel SIGKILL mpv if the thread that spawned it
+# dies. That thread (_live_worker) lives exactly as long as the IPC session
+# with mpv, so in practice this means "mpv can't outlive the popup", covering
+# crashes of the popup process where stop_embedded_stream() never runs. The
+# prctl symbol is resolved up front so the post-fork hook does nothing but
+# one foreign call.
+try:
+    import ctypes, signal as _signal
+    _prctl = ctypes.CDLL(None, use_errno=True).prctl
+except Exception:
+    _prctl = None
+
+def _mpv_preexec():
+    if _prctl is not None:
+        _prctl(1, _signal.SIGKILL, 0, 0, 0)  # 1 == PR_SET_PDEATHSIG
 
 
 def live_ipc_send(command):
@@ -429,6 +446,14 @@ def _live_worker(wid):
         if not cmd:
             return
         args, conf_path = cmd
+        # build_player_cmd blocks on HA's stream handshake; if the popup was
+        # dismissed meanwhile, stop_embedded_stream() has already run and
+        # nothing would ever reap an mpv started now.
+        with _live_lock:
+            stopping = _live['stopping']
+        if stopping:
+            _unlink_quiet(conf_path)
+            return
         # Tk is X11-only, so under a Wayland session it lives in XWayland;
         # hide WAYLAND_DISPLAY so mpv picks an X11 backend too — the Wayland
         # one can't embed into an X window and silently ignores --wid.
@@ -436,7 +461,8 @@ def _live_worker(wid):
         env['DISABLE_MANGOHUD'] = '1'  # no FPS overlay on a notification
         try:
             proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, close_fds=True)
+                                    stdout=subprocess.DEVNULL, close_fds=True,
+                                    preexec_fn=_mpv_preexec)
         except Exception as exc:
             print(f"popup: embedded player launch failed: {exc}", file=sys.stderr)
             _unlink_quiet(conf_path)
@@ -459,11 +485,33 @@ def start_embedded_stream(wid):
 
 
 def stop_embedded_stream():
+    '''Shut mpv down and wait for it. Runs on the Tk thread after the window
+    is gone, so the short wait below is invisible to the user.
+
+    A fire-and-forget SIGTERM is not enough: on a live LL-HLS stream with
+    --cache=no mpv can sit in a network read and ignore SIGTERM for seconds,
+    and once this process exits the orphan is reparented to systemd --user
+    with nothing left to track it (seen as a muted "mpv" sink-input in the
+    mixer long after the popup closed). So: ask over IPC, SIGTERM, wait,
+    then SIGKILL, and only unlink the socket once mpv is really gone.
+    '''
     with _live_lock:
+        _live['stopping'] = True
         proc, sock_path, conf_path = _live['proc'], _live['sock_path'], _live['conf_path']
     if proc and proc.poll() is None:
+        if sock_path:
+            live_ipc_send(['quit'])
         try:
             proc.terminate()
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            print("popup: embedded player ignored SIGTERM — killing it",
+                  file=sys.stderr)
+            try:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         except OSError:
             pass
     _unlink_quiet(sock_path)
@@ -1070,6 +1118,10 @@ class Notifier:
         # popup_id -> Popen of live sensor popups, so a re-firing automation
         # (grid sensor flapping) can't stack duplicate windows.
         self._sensor_popups: dict[str, "subprocess.Popen"] = {}
+        # Image popup children, so that when one exits we can hunt down an
+        # embedded mpv it failed to take with it (see _sweep_orphaned_players).
+        self._image_popups: list["subprocess.Popen"] = []
+        self._image_popups_lock = threading.Lock()
 
     # -- image fetching ------------------------------------------------------
 
@@ -1218,11 +1270,73 @@ class Notifier:
         try:
             # Inherit stderr so popup-subprocess warnings (HLS fetch failures,
             # mpv-not-found, etc.) land in the daemon's journal for debugging.
-            _spawn_with_payload(_POPUP_SCRIPT, payload)
-            return True
+            proc = _spawn_with_payload(_POPUP_SCRIPT, payload)
         except Exception as exc:
             log.warning("Image popup launch failed: %s", exc)
             return False
+        with self._image_popups_lock:
+            self._image_popups = [p for p in self._image_popups
+                                  if p.poll() is None]
+            self._image_popups.append(proc)
+        threading.Thread(target=self._reap_image_popup, args=(proc,),
+                         daemon=True, name=f"popup-reaper-{proc.pid}").start()
+        return True
+
+    def _reap_image_popup(self, proc: "subprocess.Popen") -> None:
+        """Wait for an image popup child, then clean up after it."""
+        proc.wait()
+        with self._image_popups_lock:
+            self._image_popups = [p for p in self._image_popups if p is not proc]
+        try:
+            self._sweep_orphaned_players()
+        except Exception as exc:  # never let the safety net take the thread down
+            log.warning("Orphaned player sweep failed: %s", exc)
+
+    def _sweep_orphaned_players(self) -> None:
+        """SIGKILL embedded mpv players whose popup window is gone.
+
+        Safety net behind the popup's own teardown: if the popup process
+        crashes (or its stop path fails) the embedded mpv is reparented to
+        systemd --user and keeps the stream open forever. Such a player is
+        recognisable by its hanofy_mpv_ IPC socket on argv and by a parent
+        that is not one of our live popup children. The process name must
+        also be the configured player's, so a shell or editor that merely
+        has that text on its command line is never a candidate.
+        """
+        import signal
+        with self._image_popups_lock:
+            popup_pids = {p.pid for p in self._image_popups}
+            live_pids = {p.pid for p in self._image_popups if p.poll() is None}
+        player = os.path.basename(
+            getattr(self.cfg, "live_stream_player", None) or "mpv")[:15]  # comm is truncated
+        marker = b"--input-ipc-server=/tmp/hanofy_mpv_"
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid in popup_pids:
+                continue
+            try:
+                with open(f"/proc/{pid}/comm") as fh:
+                    if fh.read().strip() != player:
+                        continue
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    cmdline = fh.read()
+                if marker not in cmdline:
+                    continue
+                with open(f"/proc/{pid}/stat") as fh:
+                    # "pid (comm) state ppid ..." — comm may contain spaces.
+                    ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue  # process vanished mid-read, or not ours to parse
+            if ppid in live_pids:
+                continue
+            log.warning("Killing orphaned embedded player (pid %d, parent %d)",
+                        pid, ppid)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     # -- live sensor popup ---------------------------------------------------
 
